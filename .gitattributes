@@ -1,0 +1,2 @@
+# 一律以 LF 检出，避免 Windows 上 core.autocrlf=true 造成的工作区与仓库不一致
+* text=auto eol=lf
