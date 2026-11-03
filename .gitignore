@@ -1,0 +1,5 @@
+state/
+node_modules/
+*.tmp
+*.db-wal
+*.db-shm

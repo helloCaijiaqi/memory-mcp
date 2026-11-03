@@ -1,0 +1,22 @@
+{
+  "name": "memory-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "平台无关的会话记忆与黑话学习服务：对 DSH 暴露 MCP 工具，对平台桥接暴露回环 HTTP。",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "main": "src/server.mjs",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "preflight": "node scripts/preflight.mjs",
+    "backup": "node scripts/backup-state.mjs",
+    "test": "node scripts/test-session-id.mjs && node scripts/test-store.mjs && node scripts/test-memory.mjs && node scripts/test-slang.mjs && node scripts/test-interfaces.mjs && node scripts/test-migrate.mjs",
+    "migrate": "node scripts/migrate-from-qq-bridge.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.7"
+  }
+}
