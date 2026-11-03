@@ -6,6 +6,7 @@
 // 端口被占用默认只提醒：生产上往往就是"本服务已经在跑"，那是正常状态。
 import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -13,6 +14,8 @@ import { createRequire } from 'node:module';
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = createRequire(import.meta.url)('../package.json');
 const REQUIRED_MAJOR = 24;
+const SERVER_SCRIPT = path.join(PKG_ROOT, 'src', 'server.mjs');
+const DSH_MCP_ID = 'mcp-memory';
 
 const results = [];
 function record(level, name, detail) {
@@ -74,6 +77,42 @@ function checkToken(tokenFile) {
   }
 }
 
+/**
+ * DSH 侧的登记状态：只提醒，不算失败。
+ *
+ * 本服务有两条对外通道：stdio MCP（DSH 派生进程）和回环 HTTP（桥接调用）。
+ * 只配桥接、不装 DSH 也是合法部署，所以这里不 fail。
+ * 判断方式刻意不用 YAML 解析：只看两件事——本服务的 id 在不在、args 指向的是不是这份代码。
+ * 目录与 install-dsh.mjs 一致：home 层对所有 profile 生效，profile 层只对一个生效。
+ */
+function checkDshEntry(env) {
+  const home = env.DSH_HOME || path.join(os.homedir(), '.dsh');
+  const profile = env.DSH_PROFILE || 'web';
+  const idRe = new RegExp(`^\\s*-\\s*id:\\s*['"]?${DSH_MCP_ID}['"]?\\s*$`, 'm');
+  const found = [];
+  for (const file of [path.join(home, 'cordis.patch.yml'), path.join(home, 'profiles', profile, 'cordis.patch.yml')]) {
+    if (!fs.existsSync(file)) continue;
+    let text = '';
+    try {
+      text = fs.readFileSync(file, 'utf8');
+    } catch (error) {
+      record('warn', 'DSH 登记', `${file} 读不了：${error?.message ?? error}`);
+      continue;
+    }
+    if (idRe.test(text)) found.push({ file, samePath: text.includes(SERVER_SCRIPT) });
+  }
+  if (!found.length) {
+    record('warn', 'DSH 登记', `未在 ${home} 的 patch 里登记（npm run install:dsh 可登记；只用回环 HTTP 时可忽略）`);
+    return;
+  }
+  const stale = found.filter((hit) => !hit.samePath);
+  if (stale.length) {
+    record('warn', 'DSH 登记', `${stale[0].file} 的条目指向别处（应为 ${SERVER_SCRIPT}）：重跑 npm run install:dsh 后新建 DSH 会话`);
+    return;
+  }
+  record('ok', 'DSH 登记', `${found[0].file}（${DSH_MCP_ID} → 本目录）`);
+}
+
 function checkPort(host, port) {
   return new Promise((resolve) => {
     const server = net.createServer();
@@ -102,6 +141,7 @@ export async function preflight({ env = process.env, logger = console.log } = {}
   await checkDeps();
   checkStateDir(stateDir);
   checkToken(path.join(stateDir, 'http-token'));
+  checkDshEntry(env);
   await checkPort('127.0.0.1', port);
 
   const failed = results.filter((r) => r.level === 'fail').length;

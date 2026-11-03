@@ -15,6 +15,7 @@ npm start          # stdio MCP（DSH）+ 回环 HTTP（127.0.0.1:7181）
 npm test           # 全量单测
 npm run migrate    # 从 qq-bridge 复制式导入（原件不动，留 .bak）
 npm run backup     # 快照到 state/backups/，保留最近 7 份
+npm run install:dsh # 把 mcp-memory 登记进 DSH（--global / --check / --remove）
 ```
 
 ## 接口
@@ -34,6 +35,23 @@ npm run backup     # 快照到 state/backups/，保留最近 7 份
 
 只认 `platform:scope:id`（如 `qq:group:123456`）。`group:群号` → `qq:group:群号` 的映射由平台桥接负责，
 本服务不解析平台语义。
+
+## 装进 DSH
+
+本服务自己负责 DSH 侧的登记（`scripts/install-dsh.mjs`），不依赖 qq-bridge 的 `setup-dsh.mjs`：
+
+```bash
+npm run install:dsh              # web profile（默认）
+npm run install:dsh -- work      # 指定 profile
+npm run install:dsh -- --global  # home 层，所有 profile 生效
+npm run install:dsh -- --check   # 只检查（未登记 / 路径不符时退出码 1）
+npm run install:dsh -- --remove  # 卸载
+```
+
+- 只写自己那段 `# === memory-mcp MCP BEGIN/END ===` 区块，`cordis.patch.yml` 里其他内容一个字节不动；
+- 写完**不用**重启 DSH（条目热加载），新建会话即可看到 `mcp__memory__*`；
+- 换机 / 换目录后必须重跑——patch 里存的是绝对路径；
+- 若曾跑过 `qq-bridge/scripts/setup-dsh.mjs`：它会整体重写 patch、把区块标记抹掉。条目仍在、工具照常可用（`--check` 也会通过），要让本脚本重新纳管就先删掉那条 `mcp-memory` 条目再重跑。
 
 ## 配置
 

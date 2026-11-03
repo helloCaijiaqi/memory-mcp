@@ -12,7 +12,8 @@
     "start": "node src/server.mjs",
     "preflight": "node scripts/preflight.mjs",
     "backup": "node scripts/backup-state.mjs",
-    "test": "node scripts/test-session-id.mjs && node scripts/test-store.mjs && node scripts/test-memory.mjs && node scripts/test-slang.mjs && node scripts/test-interfaces.mjs && node scripts/test-migrate.mjs",
+    "install:dsh": "node scripts/install-dsh.mjs",
+    "test": "node scripts/test-session-id.mjs && node scripts/test-store.mjs && node scripts/test-memory.mjs && node scripts/test-slang.mjs && node scripts/test-interfaces.mjs && node scripts/test-migrate.mjs && node scripts/test-install-dsh.mjs",
     "migrate": "node scripts/migrate-from-qq-bridge.mjs"
   },
   "dependencies": {
