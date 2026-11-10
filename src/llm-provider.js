@@ -20,9 +20,13 @@ export function createLlmProvider(config = {}) {
       return usable;
     },
     config: cfg,
-    /** 生成解释；不可用或失败都返回空串（降级，不抛错打断学习流程）。 */
-    async explain({ content, evidence = [] } = {}) {
-      if (!usable) return '';
+    /**
+     * 通用补全（摘要/画像等任务共用）。不可用或失败返回 null（调用方降级），
+     * 不抛错 —— LLM 是旁路，绝不能把主链路打断。json=true 时带 response_format
+     * 提示（OpenAI 兼容；不支持的服务端忽略该字段，解析侧仍要做坏 JSON 容错）。
+     */
+    async complete({ messages = [], temperature = 0.2, maxTokens = 512, json = false } = {}) {
+      if (!usable || messages.length === 0) return null;
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), Math.max(1000, cfg.timeoutMs));
       try {
@@ -34,30 +38,35 @@ export function createLlmProvider(config = {}) {
           },
           body: JSON.stringify({
             model: cfg.model,
-            messages: [
-              {
-                role: 'system',
-                content: '你是网络用语词典。只输出一句话解释，不超过 30 字，不要解释你的推理。',
-              },
-              {
-                role: 'user',
-                content: `词语：${content}\n上下文：${evidence.slice(0, 3).join(' / ') || '（无）'}`,
-              },
-            ],
-            temperature: 0.3,
-            max_tokens: 120,
+            messages,
+            temperature,
+            max_tokens: maxTokens,
+            ...(json ? { response_format: { type: 'json_object' } } : {}),
           }),
           signal: controller.signal,
         });
-        if (!res.ok) return '';
+        if (!res.ok) return null;
         const data = await res.json();
         const text = String(data?.choices?.[0]?.message?.content ?? '').trim();
-        return text.replace(/\s+/g, ' ').slice(0, 100);
+        return text || null;
       } catch {
-        return '';
+        return null;
       } finally {
         clearTimeout(timer);
       }
+    },
+    /** 生成解释；不可用或失败都返回空串（降级，不抛错打断学习流程）。 */
+    async explain({ content, evidence = [] } = {}) {
+      const text = await this.complete({
+        messages: [
+          { role: 'system', content: '你是网络用语词典。只输出一句话解释，不超过 30 字，不要解释你的推理。' },
+          { role: 'user', content: `词语：${content}\n上下文：${evidence.slice(0, 3).join(' / ') || '（无）'}` },
+        ],
+        temperature: 0.3,
+        maxTokens: 120,
+      });
+      if (text == null) return '';
+      return text.replace(/\s+/g, ' ').slice(0, 100);
     },
   };
 }

@@ -1,0 +1,56 @@
+{
+  "v": 1,
+  "id": "d6c8f390e18043b28507565557f68a0a",
+  "name": "memory-mcp",
+  "kind": "decorator",
+  "transport": "auto",
+  "url": "http://127.0.0.1:7181",
+  "secretEnv": "MEMORY_MCP_GATEWAY_SECRET",
+  "tools": [
+    {
+      "name": "chat_memory_recall",
+      "description": "按对话内容检索记忆（回忆），返回可直接使用的回忆文本与结构化条目",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string", "description": "检索词，通常取自用户刚说的话" },
+          "sessionId": { "type": "string", "description": "platform:scope:id 三段式；缺省用当前会话" },
+          "kinds": { "type": "array", "items": { "type": "string", "enum": ["episodic", "semantic", "relation", "emotion"] } },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 50 }
+        },
+        "required": ["text"]
+      },
+      "roles": ["tool", "decorator"]
+    },
+    {
+      "name": "chat_memory_record",
+      "description": "把一条「值得长期记住」的事实写进记忆（内容相同重复上报幂等）",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "content": { "type": "string", "description": "要记住的事实，一句话" },
+          "kind": { "type": "string", "enum": ["episodic", "semantic", "relation", "emotion"] },
+          "sessionId": { "type": "string" },
+          "subjectId": { "type": "string" },
+          "importance": { "type": "number" }
+        },
+        "required": ["content"]
+      },
+      "roles": ["tool"]
+    },
+    {
+      "name": "chat_memory_forget",
+      "description": "遗忘一条记忆（soft=归档，hard=物理删除）",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "记忆条目 id" },
+          "mode": { "type": "string", "enum": ["soft", "hard"] }
+        },
+        "required": ["id"]
+      },
+      "roles": ["tool"]
+    }
+  ],
+  "enabled": true
+}

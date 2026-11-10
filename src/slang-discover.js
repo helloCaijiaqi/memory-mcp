@@ -150,13 +150,22 @@ export function discover(messages, opts = {}) {
   }
 
   // 去掉"只是更长候选的一部分"的短串：它们没有独立出现的证据。
-  const byLengthDesc = [...candidates].sort((a, b) => b.content.length - a.content.length);
+  //
+  // 旧实现在候选之间做双重循环（O(n²) 次 includes），候选上万时会把整轮发现拖到
+  // 秒级。候选串长被 maxLen 封顶（默认 ≤6），所以改成「枚举长串的所有候选长度
+  // 子串 → Set 查表」，复杂度 O(n · L²)，语义完全等价（子串任意位置）。
+  const byContent = new Map(candidates.map((item) => [item.content, item]));
   const dropped = new Set();
+  const byLengthDesc = [...candidates].sort((a, b) => b.content.length - a.content.length);
   for (const long of byLengthDesc) {
-    for (const short of candidates) {
-      if (short === long || dropped.has(short.content)) continue;
-      if (long.content.includes(short.content) && long.freq >= short.freq * 0.9) {
-        dropped.add(short.content);
+    const text = long.content;
+    for (let len = cfg.minLen; len < text.length; len += 1) {
+      for (let i = 0; i + len <= text.length; i += 1) {
+        const sub = text.slice(i, i + len);
+        if (dropped.has(sub)) continue;
+        const short = byContent.get(sub);
+        if (!short) continue;
+        if (long.freq >= short.freq * 0.9) dropped.add(sub);
       }
     }
   }

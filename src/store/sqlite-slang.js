@@ -98,8 +98,13 @@ export function createSlangCollection({ db, usable, writable, prepare }) {
       where.push("(s.content LIKE ? ESCAPE '\\' OR s.meaning LIKE ? ESCAPE '\\')");
       params.push(likePattern(text), likePattern(text));
     }
+    // 稳定序供 head 渲染：黑话是按 score 排序的，命中数一变 head 就抖 —— 渲染 head 时必须换稳定键。
+    const orderSql =
+      opts.order === 'stable'
+        ? 'ORDER BY s.content ASC, s.id ASC'
+        : 'ORDER BY s.score DESC, s.hits DESC, s.updated_at DESC';
     const finalSql = `SELECT * FROM slang AS s ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-                      ORDER BY s.score DESC, s.hits DESC, s.updated_at DESC LIMIT ?`;
+                      ${orderSql} LIMIT ?`;
     const rows = db.prepare(finalSql).all(...params, limit).map(slangFromRow);
     void sqlWhere;
     return { rows, strategy: text ? 'like' : 'scan' };

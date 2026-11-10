@@ -33,11 +33,14 @@ export function createMemoryCollection({ db, usable, writable, prepare }) {
     const createdAt = existing?.createdAt ?? r.createdAt;
     prepare(
       'memPut',
-      `INSERT INTO memory (id, session_id, platform, tier, category, content, extra, importance,
-                           base_weight, hits, status, created_at, updated_at, last_touch_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO memory (id, session_id, platform, tier, kind, subject_id, source_msg_ids, decay_exempt,
+                           category, content, extra, importance, base_weight, hits, status,
+                           created_at, updated_at, last_touch_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          session_id = excluded.session_id, platform = excluded.platform, tier = excluded.tier,
+         kind = excluded.kind, subject_id = excluded.subject_id,
+         source_msg_ids = excluded.source_msg_ids, decay_exempt = excluded.decay_exempt,
          category = excluded.category, content = excluded.content, extra = excluded.extra,
          importance = excluded.importance, base_weight = excluded.base_weight, hits = excluded.hits,
          status = excluded.status, updated_at = excluded.updated_at,
@@ -47,6 +50,10 @@ export function createMemoryCollection({ db, usable, writable, prepare }) {
       r.sessionId,
       r.platform,
       r.tier,
+      r.kind,
+      r.subjectId,
+      JSON.stringify(r.sourceMsgIds ?? []),
+      r.decayExempt ? 1 : 0,
       r.category,
       r.content,
       r.extra,
@@ -98,6 +105,26 @@ export function createMemoryCollection({ db, usable, writable, prepare }) {
       where.push('m.category = ?');
       params.push(String(opts.category));
     }
+    if (opts.kind) {
+      where.push('m.kind = ?');
+      params.push(String(opts.kind));
+    }
+    if (Array.isArray(opts.kindIn) && opts.kindIn.length) {
+      where.push(`m.kind IN (${opts.kindIn.map(() => '?').join(', ')})`);
+      params.push(...opts.kindIn.map((item) => String(item)));
+    }
+    if (opts.subjectId) {
+      where.push('m.subject_id = ?');
+      params.push(String(opts.subjectId));
+    }
+    if (opts.since != null) {
+      where.push('m.created_at >= ?');
+      params.push(clampInt(opts.since, 0, Number.MAX_SAFE_INTEGER, 0));
+    }
+    if (opts.until != null) {
+      where.push('m.created_at <= ?');
+      params.push(clampInt(opts.until, 0, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER));
+    }
     if (!opts.includeArchived) {
       where.push('m.status = ?');
       params.push(opts.status ?? 'active');
@@ -125,11 +152,25 @@ export function createMemoryCollection({ db, usable, writable, prepare }) {
       where.push("m.content LIKE ? ESCAPE '\\'");
       params.push(likePattern(text));
     }
+    // 稳定序（order:'stable'）供 head 渲染用：排序键必须与「时间、命中、分数」无关，
+    // 否则同一批记忆每轮顺序都不同，拼出来的 head 字节就不同，前缀缓存直接作废。
+    // recent 也是确定性序（最新在前），只用于 tail 取「最近 N 条」，取完由渲染层反转成正序。
+    const stable = opts.order === 'stable';
+    const recent = opts.order === 'recent';
+    const orderSql = stable
+      ? 'ORDER BY m.kind ASC, m.subject_id ASC, m.created_at ASC, m.id ASC'
+      : recent
+        ? 'ORDER BY m.created_at DESC, m.id DESC'
+        : 'ORDER BY m.last_touch_at DESC';
     const finalSql = `SELECT * FROM memory AS m ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
-                      ORDER BY m.last_touch_at DESC LIMIT ?`;
-    // 多取一些候选再按权重排序：衰减是惰性计算的，SQL 里先按最近性粗排、JS 里精排。
-    const rows = db.prepare(finalSql).all(...params, Math.max(limit * 4, 50)).map(memoryFromRow);
-    const sorted = typeof opts.scoreOf === 'function' ? rows.sort((a, b) => opts.scoreOf(b) - opts.scoreOf(a)) : rows;
+                      ${orderSql} LIMIT ?`;
+    // 非确定性序时多取候选再按权重精排：衰减是惰性计算的，SQL 里先按最近性粗排、JS 里精排。
+    const take = stable || recent ? limit : Math.max(limit * 4, 50);
+    const rows = db.prepare(finalSql).all(...params, take).map(memoryFromRow);
+    const sorted =
+      !stable && !recent && typeof opts.scoreOf === 'function'
+        ? rows.sort((a, b) => opts.scoreOf(b) - opts.scoreOf(a))
+        : rows;
     return { rows: sorted.slice(0, limit), strategy: text ? 'like' : 'scan' };
   }
 
@@ -190,6 +231,19 @@ export function createMemoryCollection({ db, usable, writable, prepare }) {
     if (opts.tier) {
       where.push('tier = ?');
       params.push(String(opts.tier));
+    }
+    if (opts.kind) {
+      where.push('kind = ?');
+      params.push(String(opts.kind));
+    }
+    // 与 query 同语义：过期行读侧不可见（延迟淘汰只推迟物理删除，不改变可见性）。
+    if (!opts.includeExpired) {
+      where.push('(expires_at IS NULL OR expires_at > ?)');
+      params.push(opts.now ?? Date.now());
+    }
+    if (opts.platform) {
+      where.push('platform = ?');
+      params.push(String(opts.platform).toLowerCase());
     }
     if (opts.status) {
       where.push('status = ?');

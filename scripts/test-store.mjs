@@ -5,7 +5,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { openStore } from '../src/store/store-api.js';
+import {
+  openStore, shouldFallbackToJson, StoreMigrationError, StoreUnavailableError,
+} from '../src/store/store-api.js';
 
 const TMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'memory-mcp-store-'));
 const SESSION = 'qq:group:10086';
@@ -20,6 +22,16 @@ async function withStore(backend, fn) {
     store.close();
   }
 }
+
+test('openStore 降级策略：打不开才回落 JSON，迁移失败必须抛', () => {
+  // 打不开（磁盘/依赖缺失）→ 允许降级，能力受损但数据在新库里。
+  assert.equal(shouldFallbackToJson(new StoreUnavailableError('no sqlite')), true);
+  // 迁移失败 → 不降级（否则服务对着空 JSON 库「健康」运行，旧数据静默消失）。
+  assert.equal(shouldFallbackToJson(new StoreMigrationError('migrate failed')), false);
+  // 只读巡检 / 显式 sqlite：从不降级。
+  assert.equal(shouldFallbackToJson(new StoreUnavailableError('x'), { readonly: true }), false);
+  assert.equal(shouldFallbackToJson(new StoreUnavailableError('x'), { backend: 'sqlite' }), false);
+});
 
 function runSuite(backend) {
   test(`[${backend}] 写入并读回：platform 由 sessionId 推导，服务不认识 QQ 语义`, async () => {
@@ -97,6 +109,38 @@ function runSuite(backend) {
       const second = store.memory.prune({ sessionId: SESSION, maxEntries: 2 });
       assert.equal(second.evicted, 2, '超出容量应按权重淘汰最低分');
       assert.equal(store.memory.count({ sessionId: SESSION }), 2);
+    });
+  });
+
+  test(`[${backend}] prune：容量淘汰只在 sessionId/tier 范围内计数（不误删别的会话）`, async () => {
+    await withStore(backend, async (store) => {
+      const OTHER = 'qq:group:8888';
+      for (let i = 0; i < 4; i += 1) {
+        store.memory.put({ sessionId: SESSION, tier: 'short', content: `本会话 ${i}` });
+        store.memory.put({ sessionId: OTHER, tier: 'short', content: `别的会话 ${i}` });
+      }
+      // 只要求本会话不超过 2 条：别的会话必须原样保留。
+      const result = store.memory.prune({ sessionId: SESSION, tier: 'short', maxEntries: 2 });
+      assert.equal(result.evicted, 2);
+      assert.equal(store.memory.count({ sessionId: SESSION, tier: 'short' }), 2);
+      assert.equal(store.memory.count({ sessionId: OTHER, tier: 'short' }), 4, '不能按别的会话的写入淘汰它的记忆');
+
+      // tier 也要参与范围：short 满额不该动 long。
+      store.memory.put({ sessionId: SESSION, tier: 'long', content: '长期记忆' });
+      store.memory.prune({ sessionId: SESSION, tier: 'short', maxEntries: 1 });
+      assert.equal(store.memory.count({ sessionId: SESSION, tier: 'long' }), 1, 'tier 不在范围内不得被淘汰');
+    });
+  });
+
+  test(`[${backend}] transaction：拒绝 async 回调（否则 COMMIT 早于 await，半写不回滚）`, async () => {
+    await withStore(backend, async (store) => {
+      assert.throws(
+        () => store.transaction(async () => 1),
+        /同步函数/,
+      );
+      // 拒绝后事务必须已经回滚：后续同步事务仍能正常提交。
+      const out = store.transaction(() => store.memory.put({ sessionId: SESSION, content: '事务可用' }));
+      assert.ok(out.id);
     });
   });
 
