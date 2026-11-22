@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "baseUrl": "http://127.0.0.1:7863/v1",
+  "apiKey": "<your-api-key>",
+  "model": "cn:deepseek-v4.1-flash",
+  "timeoutMs": 30000
+}

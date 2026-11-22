@@ -1,0 +1,9 @@
+{
+  "v": 1,
+  "id": "memory-mcp",
+  "kind": "service",
+  "url": "http://127.0.0.1:7190",
+  "transport": "auto",
+  "secretFile": "C:/agent-gateway/state/gateway/secrets/memory-mcp.secret",
+  "_comment": "复制到本仓库根目录并保持文件名 gateway.json。url 是网关基址（不是本服务地址：本服务自己的地址在网关登记文件里）。secretFile 指向网关侧密钥文件；跨机复制改成 secret 内联明文。文件缺失 = 不接入网关（stdio MCP 照常可用）。"
+}

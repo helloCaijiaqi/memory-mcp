@@ -4,7 +4,7 @@
 
 - 记忆：**会话纪元模型** —— 短期记忆由 DSH 上下文承担，本服务只管「跨会话」：raw 全量落地 + 长期摘要
 - 原始层：入站/出站消息经网关防抖成批落地（50 条或 30s 窗口），超期转 gzip 归档；摘要与派生记忆都带锚点，压缩后仍可回指原文
-- 长期层：只由 `record` / 手动巩固 / **失活摘要**产生；会话静默 ≥60 分钟即失活，从 raw 本会话窗口生成摘要（LLM，默认关，关闭时退化为 record-only）
+- 长期层：只由 `record` / 手动巩固 / **会话 save 摘要**产生（tool.call 统一改造：落地时机完全由网关裁决——网关在会话空闲/触顶/关停时把整段缓冲经 `tool.call chat_memory_save` 投递过来，本服务单事务落地 raw/别名/摘要/画像/关系并推进纪元；内部失活摘要调度器已删除，LLM 默认关，关闭时退化为 record-only）
 - 召回只发生一次：会话创建（新纪元 epoch）时注入 identity（【画像】+【关系】）与【长期记忆】，由网关按 `(sessionKey, subjectId, epoch)` 去重；后续轮次靠 DSH 上下文
 - 人物画像：`profile` + `profile_history` 版本链（性格/说话风格/口头禅/禁忌/关系定位），摘要任务整份合并，可回滚
 - 关系：按「平台 + 会话 + 说话人 + 键」单值保存，变更留版本链；自动抽取受可信度守卫（覆盖需 ≥0.9 或跨窗口二次确认，不够格进 `relation_pending` 等人工确认）
@@ -77,7 +77,7 @@ node scripts/raw-archive.mjs --session qq:group:1  # 只处理某个会话
 
 ### MCP 工具
 
-- 记忆：`memory_append` `query` `touch` `forget` `restore` `consolidate` `ingest` `record`；只读工具 `chat_memory_profile` / `chat_memory_relation`（会话纪元召回配套）
+- 记忆：`memory_append` `query` `touch` `forget` `restore` `consolidate` `ingest` `record`；网关工具面（tool.call 唯一信封）：`chat_memory_get`（decorator：画像双层 scope 合并 + 关系 + 长期记忆，按纪元首轮注入）、`chat_memory_save`（整段会话缓冲单事务落地）、`chat_memory_recall` / `chat_memory_record` / `chat_memory_forget`；subject 身份层按 `sender.names`（群名片 → 会话内别名、昵称 → 全局别名）解析名字
 - 分段注入：`memory_context_head` `tail` `compose` `invalidate`；旧整块：`memory_context_render`
 - 召回：`memory_recall`
 - 关系：`relation_set` `get` `list` `history` `forget`
@@ -131,7 +131,7 @@ node scripts/raw-archive.mjs --session qq:group:1  # 只处理某个会话
 - 衰减：`score = baseWeight·e^(-λ·天) + 命中加成 + 重要度加成`；`λ=0.08/天`，情绪 `λ=0.5/天`，`decayExempt` 行（关系与显式豁免）λ 取 0
 - 容量：长期 500（短期 200 仅对存量行生效），超出按 score 淘汰；prune 节流（每 20 次写或 60s）+ `expires_at` 部分索引，写入不再全表扫描
 - 召回：默认 `maxRows=5` / `maxChars=400` / 单条 200 字；先查 `memory_fts`，再从 `raw_fts` 捞原文兜底（同 `msgId` 去重，摘要优先）
-- 失活摘要：静默 ≥ `MEMORY_MCP_SUMMARY_QUIET_MINUTES`（默认 60，与纪元失活阈值同源）后从 raw 本会话窗口生成摘要，窗口哈希幂等，摘要/画像/游标同事务，失败回滚重试；LLM 关闭时不跑
+- 会话 save（取代失活摘要）：网关把整段会话缓冲投到 `chat_memory_save`，单事务内 raw 幂等落地（UNIQUE(session_id,msg_id)）→ subject_alias 别名登记 → 窗口哈希幂等摘要 → 画像/关系（过守卫）→ 纪元+1（仅会话收尾 save，partial 分段不推进）；LLM 启用但调用失败时整个 save 抛错（网关缓冲保留退避重试），关闭时跳过摘要层照常落地
 - 召回 `strategy` 如实上报 `fts5 | like | scan | unavailable`：2 字查询必然落 `like`，JSON 兜底后端不会假装有 FTS
 
 ## 平台维度
@@ -215,21 +215,48 @@ npm run install:dsh -- --remove  # 卸载
 - 换机 / 换目录后必须重跑——patch 里存的是绝对路径；
 - 若曾跑过 `qq-bridge/scripts/setup-dsh.mjs`：它会整体重写 patch、把区块标记抹掉。条目仍在、工具照常可用（`--check` 也会通过），要让本脚本重新纳管就先删掉那条 `mcp-memory` 条目再重跑。
 
-## 网关 WS 长连接（V2 主线）
+## 网关接入（`gateway.json`）
 
-`service.call` / `tool.call` 默认由网关走 HTTP 端点投递；配了 WS 长连接后，同一组
-处理函数改由 `/v1/ws` 帧调用（业务零改动，见 `src/service/ws-connector.js`）。
+`tool.call`（唯一服务间信封；`service.call` 已全链路下线）的凭据与地址**只从仓库根目录的 `gateway.json` 读取**（不再读
+`*_GATEWAY_*` 环境变量——设了会直接报错，避免「改了却不生效」）。传输按角色非对称：资源服务纯被动，
+网关只经 HTTP `POST /v1/tools/call` 调用本服务（WS 能力已退役）。
 
-| 环境变量 | 说明 |
+网关侧登记（Agent-Gateway 控制台）：`kind=resource`、`transport=http`、`url` 填本服务地址
+（如 `http://127.0.0.1:7181`，仅回环）；secret 可留空由网关自动生成，交接文件
+`state/gateway/handoff/<登记id>.gateway.json` 直接拿去改名。登记文件禁止未知键
+（strictObject，残留 `capability` 之类直接拒载）；`memoryService` 用对象形态
+`{ "saveTool": "<工具名>" }`（布尔旧形态虽兼容但不建议）。
+
+三步：
+
+```bash
+# ① 网关侧注册服务后生成（agent-gateway 仓库，控制台注册也会直接返回路径）
+npm run handoff -- --service <登记id>        # 或注册响应里的 handoffFile
+# ② 复制到本仓库根目录，保持文件名
+cp <gateway>/state/gateway/handoff/<登记id>.gateway.json ./gateway.json
+# ③ 启动（日志会打印读的是哪个文件、什么身份、密钥从哪来）
+npm start
+```
+
+| 字段 | 说明 |
 | --- | --- |
-| `MEMORY_MCP_GATEWAY_SECRET` | 网关共享密钥（必填，≥16 字符；与登记文件 `secretEnv` 同源） |
-| `MEMORY_MCP_GATEWAY_ID` | 登记文件 id（打开 WS 时必填） |
-| `MEMORY_MCP_GATEWAY_WS_URL` | 网关基址（如 `http://127.0.0.1:8787`）；留空 = 不建连接（纯 HTTP） |
-| `MEMORY_MCP_GATEWAY_TRANSPORT` | `ws` 或 `auto`（默认 `auto`）；非法值启动即失败 |
+| `v` | 固定 `1` |
+| `id` | 登记文件 id（32 位 hash 或可读 id）。与网关逐字一致，否则验签 401 |
+| `url` | **网关基址**（如 `http://127.0.0.1:7190`）。⚠️ 不是本服务地址 |
+| `transport` | 只支持 `http`（缺省同值）；资源服务纯被动，WS 已退役，配 `ws`/`auto` 启动即报错（带迁移文案） |
+| `secretFile` | 网关侧密钥文件的路径；相对路径按 `gateway.json` 所在目录解析 |
+| `secret` | 内联明文（跨机复制用）；与 `secretFile` 并存时以 `secretFile` 为准并告警 |
 
-部署前提（缺一即握手 401）：网关 `GATEWAY_WS=on`；登记目录里本服务条目存在且
-secret 一致；`transport` 建议改 `auto`（有 WS 连接走帧、否则回落 HTTP）。
-连接断开期间网关自动回落 HTTP，无需人工切换；服务侧断线按 1s→30s 退避重连。
+- **文件缺失 = 不接入网关**：`/v1` 不启用，stdio MCP（DSH 工具面）照常可用；启动日志与
+  `npm run preflight` 都会给出提示。
+- **热加载（2026-11-14 起）**：gateway.json 的出现、修复、换密钥 ≤2s 自动生效，**无需重启**。
+  /v1/tools/call 常挂载——未生效时返回 503 带修复文案。文件非法或被移除 → 网关接入摘除
+  （503）+ 告警日志；修复后自动恢复。变更检测按内容哈希轮询，网关重注册/换密钥重写文件即触发。
+- 文件存在但字段非法（如 `transport` 非 `http`）→ /v1 返回 503 摘除并告警（不带着坏凭据服务）；
+  修复后自动恢复，不再要求重启。
+- 部署前提（缺一即验签 401）：登记目录里有本服务且 secret 与 `gateway.json` 一致；
+  transport 须为 `http`（网关 → 本服务的 HTTP tool.call 是唯一通道）。
+- `gateway.json` 含凭据：已加入 `.gitignore`，模板见 `gateway.example.json`。
 
 ## 许可
 

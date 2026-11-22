@@ -38,14 +38,24 @@ export function normalizeSessionId(raw) {
     throw new SessionIdError(`sessionId 过长（${text.length} > ${MAX_SESSION_ID_LENGTH}）：${text.slice(0, 40)}…`);
   }
   const parts = text.split(':');
-  if (parts.length !== 3) {
-    throw new SessionIdError(`sessionId 必须是 platform:scope:id 三段式，实际 ${parts.length} 段：${text}`);
+  // 多消费端收编：4 段 = platform:consumerId:kind:id（会话绑消费端，如
+  // `qq:svc-a3f2b9c1d4e5:group:123`）；3 段为旧口径（存量数据照常读写）。
+  if (parts.length !== 3 && parts.length !== 4) {
+    throw new SessionIdError(`sessionId 必须是 platform:scope:id 或 platform:consumerId:scope:id，实际 ${parts.length} 段：${text}`);
   }
-  const [platform, scope, id] = parts.map((part) => part.trim());
+  const consumerId = parts.length === 4 ? parts[1].trim().toLowerCase() : null;
+  const [platform, scope, id] = (parts.length === 4 ? [parts[0], parts[2], parts[3]] : parts)
+    .map((part) => part.trim());
   const lowerPlatform = platform.toLowerCase();
   const lowerScope = scope.toLowerCase();
   if (!PLATFORM_RE.test(lowerPlatform)) {
     throw new SessionIdError(`platform 段不合法（仅允许字母开头 + 字母数字_-，最长 32）：${platform}`);
+  }
+  if (consumerId !== null) {
+    // consumerId 段复用 scope 词法（登记 hash id `svc-xxxx` 天然满足）。
+    if (!SCOPE_RE.test(consumerId)) {
+      throw new SessionIdError(`consumerId 段不合法（仅允许字母开头 + 字母数字_-，最长 32）：${consumerId}`);
+    }
   }
   if (!SCOPE_RE.test(lowerScope)) {
     throw new SessionIdError(`scope 段不合法（仅允许字母开头 + 字母数字_-，最长 32）：${scope}`);
@@ -55,7 +65,9 @@ export function normalizeSessionId(raw) {
     throw new SessionIdError(`id 段过长（${id.length} > ${MAX_RAW_ID_LENGTH}）`);
   }
   if (hasControlChars(id)) throw new SessionIdError('id 段不能包含控制字符');
-  return `${lowerPlatform}:${lowerScope}:${id}`;
+  return consumerId !== null
+    ? `${lowerPlatform}:${consumerId}:${lowerScope}:${id}`
+    : `${lowerPlatform}:${lowerScope}:${id}`;
 }
 
 /** 拼装 sessionId（三个字段各自可来自平台桥接的原始值）。 */
@@ -72,9 +84,14 @@ export function isValidSessionId(value) {
   }
 }
 
-/** 拆成 { platform, scope, id }；已保证 platform / scope 为小写。 */
+/** 拆成 { platform, consumerId?, scope, id }；已保证 platform / scope / consumerId 为小写。 */
 export function parseSessionId(value) {
   const normalized = normalizeSessionId(value);
-  const [platform, scope, id] = normalized.split(':');
-  return { platform, scope, id, sessionId: normalized };
+  const parts = normalized.split(':');
+  if (parts.length === 4) {
+    const [platform, consumerId, scope, id] = parts;
+    return { platform, consumerId, scope, id, sessionId: normalized };
+  }
+  const [platform, scope, id] = parts;
+  return { platform, consumerId: null, scope, id, sessionId: normalized };
 }

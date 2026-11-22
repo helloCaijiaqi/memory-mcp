@@ -13,16 +13,33 @@ test('未来的微信会话不需要改动本服务', () => {
   assert.equal(parseSessionId('wx:room:xxx').platform, 'wx');
   assert.deepEqual(parseSessionId('wx:room:xxx'), {
     platform: 'wx',
+    consumerId: null,
     scope: 'room',
     id: 'xxx',
     sessionId: 'wx:room:xxx',
   });
 });
 
+test('多消费端收编：4 段会话键（platform:consumerId:scope:id）合法且段结构保留', () => {
+  // 网关多账号改造后 sessionKey 变 4 段（会话绑消费端）：normalize 保留 consumerId
+  // 段——同一 subject 在不同账号会话里的记忆仍归同一 subject 身份层（platform+QQ号）。
+  const four = 'qq:svc-a3f2b9c1d4e5:group:123456';
+  assert.equal(normalizeSessionId(four), four);
+  assert.deepEqual(parseSessionId(four), {
+    platform: 'qq',
+    consumerId: 'svc-a3f2b9c1d4e5',
+    scope: 'group',
+    id: '123456',
+    sessionId: four,
+  });
+  // consumerId 段词法与 scope 一致：非法形态拒绝。
+  assert.throws(() => normalizeSessionId('qq:svc-a3f2b9c1d4e5:9group:123'), /scope 段不合法/);
+});
+
 test('非法输入一律抛错（不静默截断，避免两条记忆撞到同一个键）', () => {
   assert.throws(() => normalizeSessionId(''), /不能为空/);
-  assert.throws(() => normalizeSessionId('qq:group'), /三段式/);
-  assert.throws(() => normalizeSessionId('qq:group:123:extra'), /三段式/);
+  assert.throws(() => normalizeSessionId('qq:group'), /platform:scope:id 或 platform:consumerId:scope:id/);
+  assert.throws(() => normalizeSessionId('qq:group:123:extra:more'), /platform:scope:id 或 platform:consumerId:scope:id/);
   assert.throws(() => normalizeSessionId('9qq:group:123'), /platform 段不合法/);
   assert.throws(() => normalizeSessionId('qq:9group:123'), /scope 段不合法/);
   assert.throws(() => normalizeSessionId('qq:group:'), /id 段不能为空/);

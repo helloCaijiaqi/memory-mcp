@@ -1,6 +1,7 @@
-// 会话纪元专项：epoch 惰性推进（静默判定 + CAS 防并发双推进）、活跃触点、
-// render 多 block 空边界（无 subject / 无长期 / 全空）、关系渲染降权、
-// 双后端（sqlite / json）语义一致。全部离线。
+// 会话纪元专项（tool.call 统一改造后语义）：epoch 推进只发生在 save 事务
+// （session-save.js，落地时机完全由网关裁决），render 读路径只读不推进；
+// CAS 防并发双推进、活跃触点、render 多 block 空边界（无 subject / 无长期 /
+// 全空）、关系渲染降权、双后端（sqlite / json）语义一致。全部离线。
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -36,7 +37,7 @@ test('epoch：首条消息建立状态行（epoch=1，活跃时间取消息时�
   }
 });
 
-test('epoch：推进只发生在读路径 —— 活跃期内 render 不推进；静默后首次 render 推进', async () => {
+test('epoch：读路径只读 —— render 无论活跃/静默都不推进、不 touch（推进在 save 事务）', async () => {
   const { store, service, close } = await fixture({ sessionIdleMs: 1000 });
   try {
     const t0 = Date.now() - 10_000;
@@ -45,18 +46,19 @@ test('epoch：推进只发生在读路径 —— 活跃期内 render 不推进�
     service.ingest({ sessionId: SESSION, msgId: 'm2', senderId: 'u1', text: '还在聊', createdAt: t0 + 100 });
     assert.equal(store.sessionState.get(SESSION).epoch, 1);
 
-    // 活跃会话：touch 到当前时刻，render 不推进。
-    store.sessionState.touchActivity(SESSION, { platform: 'qq', at: Date.now() });
+    const before = store.sessionState.get(SESSION);
     const active = service.render({ sessionId: SESSION, subjectId: '' });
-    assert.equal(active.epoch, 1, '活跃期内不推进纪元');
+    assert.equal(active.epoch, 1, 'render 返回当前纪元');
+    const afterActive = store.sessionState.get(SESSION);
+    assert.equal(afterActive.epoch, before.epoch, '活跃期内 render 不推进');
+    assert.equal(afterActive.lastActivityAt, before.lastActivityAt, 'render 不刷新活跃触点（高频读不该扰动失活窗口）');
 
-    // 静默超阈值（lastActivity 停在 t0+100，距今 9.9s > 1s）：读路径发现即推进。
+    // 静默超阈值（lastActivity 停在 t0+100，距今 9.9s > 1s）：读路径也只读——
+    // 新纪元由网关 session-save 的会话收尾 save 推进（见 test-session-save.mjs）。
     service.ingest({ sessionId: SESSION, msgId: 'm3', senderId: 'u1', text: '隔了很久又来了', createdAt: t0 + 2100 });
     const woken = service.render({ sessionId: SESSION, subjectId: '' });
-    assert.equal(woken.epoch, 2, '静默后首次读路径应推进纪元（新会话首轮）');
-    // 推进完即 touch：同一纪元内的后续轮次不再推进。
-    const again = service.render({ sessionId: SESSION, subjectId: '' });
-    assert.equal(again.epoch, 2);
+    assert.equal(woken.epoch, 1, '读路径不再推进纪元（统一改造：推进迁到 save）');
+    assert.equal(store.sessionState.get(SESSION).epoch, 1);
   } finally {
     close();
   }
@@ -94,11 +96,11 @@ test('epoch：摘要游标 markSummarized 落在 session_state（不单设 summa
   }
 });
 
-test('render 空边界：全空 → blocks 为空但 epoch 照常返回；无 subject → 只有长期块', async () => {
+test('render 空边界：全空 → blocks 为空，epoch 只读（未 touch 过的会话 = null 无纪元）；无 subject → 只有长期块', async () => {
   const { service, close } = await fixture();
   try {
     const empty = service.render({ sessionId: SESSION });
-    assert.ok(Number.isInteger(empty.epoch) && empty.epoch >= 1, '全空也必须有纪元');
+    assert.equal(empty.epoch, null, '读路径不创建会话状态（epoch 推进在 save，未落地会话无纪元）');
     assert.deepEqual(empty.blocks, [], '全空不注入任何段');
     assert.equal(empty.truncated, false);
 

@@ -19,6 +19,20 @@ export function createProfileCollection({ usable, writable, prepare }) {
     );
   }
 
+  /**
+   * 全局画像（scope='identity'，session_id=''）：profile 双层 scope 的打底层，
+   * 以 (platform, subject_id) 为键。无会话上下文也能取到「这个人是谁」。
+   */
+  function getIdentity(platform, subjectId) {
+    if (!usable() || !subjectId) return null;
+    return profileFromRow(
+      prepare(
+        'pfGetIdentity',
+        "SELECT * FROM profile WHERE session_id = '' AND scope = 'identity' AND platform = ? AND subject_id = ?",
+      ).get(String(platform ?? '').toLowerCase(), String(subjectId)),
+    );
+  }
+
   function list(sessionId) {
     if (!usable()) return [];
     return prepare('pfList', 'SELECT * FROM profile WHERE session_id = ? ORDER BY updated_at DESC')
@@ -30,31 +44,34 @@ export function createProfileCollection({ usable, writable, prepare }) {
    * 写当前版 + 历史快照（每次 put 一条 history，版本号由调用方算好传入——版本
    * 语义归 service 层）。history id 由 (session, subject, version) 确定性派生。
    */
-  function put({ sessionId, subjectId, platform = '', attributes, confidence, sourceMsgIds = [], version, at = Date.now() }) {
+  function put({ sessionId, subjectId, platform = '', scope = 'session', attributes, confidence, sourceMsgIds = [], version, at = Date.now() }) {
     writable();
-    const sid = normalizeSessionId(sessionId);
+    // identity 层：session_id 恒空串（PK 仍成立），platform 必须显式给出。
+    const sid = scope === 'identity' ? '' : normalizeSessionId(sessionId);
+    if (scope === 'identity' && !platform) throw new TypeError('profile.put(identity) 需要 platform');
     const subject = String(subjectId);
     const ts = Number(at);
     const attrsJson = JSON.stringify(attributes ?? {});
     const anchorsJson = JSON.stringify((sourceMsgIds ?? []).slice(0, 200));
     prepare(
       'pfPut',
-      `INSERT INTO profile (session_id, platform, subject_id, attributes, confidence, source_msg_ids, version, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO profile (session_id, platform, subject_id, scope, attributes, confidence, source_msg_ids, version, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(session_id, subject_id) DO UPDATE SET
          platform = excluded.platform,
+         scope = excluded.scope,
          attributes = excluded.attributes,
          confidence = excluded.confidence,
          source_msg_ids = excluded.source_msg_ids,
          version = excluded.version,
          updated_at = excluded.updated_at`,
-    ).run(sid, String(platform ?? ''), subject, attrsJson, Number(confidence), anchorsJson, Number(version), ts, ts);
+    ).run(sid, String(platform ?? ''), subject, scope === 'identity' ? 'identity' : 'session', attrsJson, Number(confidence), anchorsJson, Number(version), ts, ts);
     prepare(
       'pfHist',
       `INSERT INTO profile_history (id, session_id, subject_id, version, attributes, confidence, source_msg_ids, changed_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(`pfh:${sid}:${subject}:${version}`, sid, subject, Number(version), attrsJson, Number(confidence), anchorsJson, ts);
-    return get(sid, subject);
+    return scope === 'identity' ? getIdentity(platform, subject) : get(sid, subject);
   }
 
   /** 版本链（新→旧）。 */
@@ -82,5 +99,5 @@ export function createProfileCollection({ usable, writable, prepare }) {
     return Number(prepare('pfCount', 'SELECT COUNT(*) AS n FROM profile').get().n ?? 0);
   }
 
-  return { get, list, put, history, remove, count };
+  return { get, getIdentity, list, put, history, remove, count };
 }

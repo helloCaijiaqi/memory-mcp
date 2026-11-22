@@ -15,6 +15,7 @@ import { createSnapshotCollection } from './sqlite-snapshot.js';
 import { createSessionStateCollection } from './sqlite-session-state.js';
 import { createProfileCollection } from './sqlite-profile.js';
 import { createRelationPendingCollection } from './sqlite-relation-pending.js';
+import { createSubjectAliasCollection } from './sqlite-subject-alias.js';
 
 const ALTER_ADD_COLUMN_RE = /^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+([A-Za-z_][A-Za-z0-9_]*)/i;
 
@@ -175,6 +176,7 @@ export function openSqliteStore({ dir, file = 'memory.db', logger = console, rea
   const sessionState = createSessionStateCollection({ usable, writable, prepare });
   const profile = createProfileCollection({ usable, writable, prepare });
   const relationPending = createRelationPendingCollection({ usable, writable, prepare });
+  const subjectAlias = createSubjectAliasCollection({ usable, writable, prepare });
 
   /**
    * 事务：让「原始层 + 短期层」两次写入要么都发生、要么都不发生。
@@ -227,6 +229,7 @@ export function openSqliteStore({ dir, file = 'memory.db', logger = console, rea
     sessionState,
     profile,
     relationPending,
+    subjectAlias,
     transaction,
     /**
      * 按平台统计行数：跨平台接入后，「这个库里到底存了哪些平台的数据」是运维必看的一项。
@@ -249,6 +252,7 @@ export function openSqliteStore({ dir, file = 'memory.db', logger = console, rea
         ['sessionState', 'session_state'],
         ['profile', 'profile'],
         ['relationPending', 'relation_pending'],
+        ['subjectAlias', 'subject_alias'],
       ]) {
         // 只读打开一个「还没迁移到最新版」的老库时，新表不存在是正常状态：统计跳过，不炸自检。
         let rows = [];
@@ -282,6 +286,7 @@ export function openSqliteStore({ dir, file = 'memory.db', logger = console, rea
         sessionState: safe(() => sessionState.count()),
         profile: safe(() => profile.count()),
         relationPending: safe(() => relationPending.count()),
+        subjectAlias: safe(() => subjectAlias.count()),
         readonly,
         schemaVersion,
       };

@@ -229,7 +229,7 @@ test('HTTP：参数不合法时返回明确错误与错误码，不静默成功'
     const auth = { 'x-mcp-token': token };
     const bad = await call(port, '/api/memory/append', { sessionId: 'not-a-session-id', content: 'x' }, auth);
     assert.equal(bad.status, 400);
-    assert.ok(bad.body.error.includes('三段式'), `错误信息应说明原因，实际：${bad.body.error}`);
+    assert.ok(bad.body.error.includes('platform:scope:id'), `错误信息应说明原因，实际：${bad.body.error}`);
     assert.equal(bad.body.code, 'bad_request');
   });
 });

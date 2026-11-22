@@ -98,6 +98,8 @@ function memoryHit(row, query, cfg) {
     category: row.category,
     content,
     msgId,
+    // 2026-11-21 审计修复：保留原始行供 raw 层去重登记全部 sourceMsgIds 使用。
+    row,
     anchor: msgId ? anchorId(row.sessionId, msgId) : '',
     createdAt: row.createdAt,
     relevance: relevanceOf(row.content, query) + cfg.memoryBonus,
@@ -161,9 +163,15 @@ export function createFts5Backend({ store, config = {} } = {}) {
       }
 
       // 原文兜底：摘要被淘汰/归档后，原文仍然是「唯一不可重建」的那一层。
+      // 2026-11-21 审计修复：摘要行登记**全部** sourceMsgIds——否则摘要已概括的
+      // 原文（msgId 2..n）会照常命中 raw 层，同一件事「摘要+原文」重复注入。
       const raws = [];
+      const seenMsgIds = new Set();
+      for (const hit of memories) {
+        const ids = (hit.row?.sourceMsgIds?.length ? hit.row.sourceMsgIds : (hit.msgId ? [hit.msgId] : []));
+        for (const id of ids) if (id) seenMsgIds.add(id);
+      }
       if (typeof store?.raw?.query === 'function') {
-        const seenMsgIds = new Set(memories.map((hit) => hit.msgId).filter(Boolean));
         for (const scope of scopes) {
           const out = store.raw.query({ ...scope, text: query, senderId: subjectId, since, until, limit: take });
           strategies.add(out.strategy ?? 'scan');

@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { openStore } from '../src/store/store-api.js';
 import { SCHEMA_VERSION } from '../src/store/sqlite-schema.js';
+import { loadGatewayConfig } from '../src/gateway-config.js';
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = createRequire(import.meta.url)('../package.json');
@@ -245,6 +246,25 @@ function checkPort(host, port) {
   });
 }
 
+/**
+ * 网关接入：只报告「读到了没有、身份是谁、密钥从哪来」，不打印密钥。
+ *
+ * 缺失只算提醒（warn）而不是失败：本服务可以作为纯 stdio MCP 使用，接入网关是可选能力。
+ * 文件存在但非法 / 残留旧环境变量 → fail，因为那属于「以为配好了其实没生效」。
+ */
+function checkGateway(env) {
+  try {
+    const gateway = loadGatewayConfig({ root: PKG_ROOT, env, envPrefix: 'MEMORY_MCP_' });
+    if (!gateway) {
+      record('warn', '网关接入', `未发现 ${path.join(PKG_ROOT, 'gateway.json')}：不接入网关（stdio MCP 照常可用）`);
+      return;
+    }
+    record('ok', '网关接入', `${gateway.file}（id=${gateway.id} auth=${gateway.auth} transport=${gateway.transport}）`);
+  } catch (error) {
+    record('fail', '网关接入', error?.message ?? String(error));
+  }
+}
+
 export async function preflight({ env = process.env, logger = console.log } = {}) {
   // 每次调用都从空结论开始：CLI 只跑一次，但被测试/巡检复用时会累加上一次的条目。
   results.length = 0;
@@ -261,6 +281,7 @@ export async function preflight({ env = process.env, logger = console.log } = {}
   checkPlatforms(env);
   await checkStore(stateDir, env);
   checkDshEntry(env);
+  checkGateway(env);
   await checkPort('127.0.0.1', port);
 
   const failed = results.filter((r) => r.level === 'fail').length;

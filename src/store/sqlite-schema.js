@@ -8,7 +8,7 @@
 // 为什么不用 SCHEMA 改表：SCHEMA 靠 IF NOT EXISTS 执行，对「表已存在但缺列」完全无效，
 // 老库会静默缺列（写入报错或字段丢失），这类问题在生产上极难定位。
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS memory (
@@ -60,10 +60,13 @@ CREATE TABLE IF NOT EXISTS session_state (
 );
 
 -- 人物画像（每对象一份）+ 版本链（可回滚）。
+-- scope 双层（V2 统一改造）：identity = 全局画像（session_id=''，platform+subject_id
+-- 打底），session = 会话覆盖（存量口径，默认值）。get 时 identity 打底 + session 覆盖。
 CREATE TABLE IF NOT EXISTS profile (
   session_id     TEXT NOT NULL,
   platform       TEXT NOT NULL DEFAULT '',
   subject_id     TEXT NOT NULL,
+  scope          TEXT NOT NULL DEFAULT 'session',
   attributes     TEXT NOT NULL DEFAULT '{}',
   confidence     REAL NOT NULL DEFAULT 0.5,
   source_msg_ids TEXT NOT NULL DEFAULT '[]',
@@ -103,6 +106,27 @@ CREATE TABLE IF NOT EXISTS relation_pending (
   updated_at     INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_relation_pending ON relation_pending(status, created_at);
+
+-- subject 身份层（V2 统一改造）：别名 → subjectId 的解析索引。
+--   scope='global'         全局昵称（sender.names.nickname）
+--   scope='session:<sid>'  会话内群名片（sender.names.card）
+-- 解析顺序 = 当前会话群名片优先 → 全局昵称；同别名指向多个 subject 时按
+-- confidence 取最高（重名冲突的后来者登记为低置信度，见 subject-service）。
+CREATE TABLE IF NOT EXISTS subject_alias (
+  id          TEXT PRIMARY KEY,
+  platform    TEXT NOT NULL,
+  subject_id  TEXT NOT NULL,
+  alias       TEXT NOT NULL,
+  scope       TEXT NOT NULL DEFAULT 'global',
+  confidence  REAL NOT NULL DEFAULT 1,
+  source      TEXT NOT NULL DEFAULT '',
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_subject_alias_unique
+  ON subject_alias(platform, alias, scope, subject_id);
+CREATE INDEX IF NOT EXISTS idx_subject_alias_lookup
+  ON subject_alias(platform, alias, scope);
 `;
 
 // platform 一律由 session_id 派生，CHECK 只做兜底：两处不一致说明上层绕过了 normalizeSessionId。
@@ -251,6 +275,32 @@ export const MIGRATIONS = [
       `CREATE INDEX IF NOT EXISTS idx_relation_pending ON relation_pending(status, created_at)`,
     ],
   },
+  {
+    version: 3,
+    statements: [
+      // --- subject 身份层（tool.call 统一改造）：别名 → subjectId 解析索引 ---
+      `CREATE TABLE IF NOT EXISTS subject_alias (
+         id          TEXT PRIMARY KEY,
+         platform    TEXT NOT NULL,
+         subject_id  TEXT NOT NULL,
+         alias       TEXT NOT NULL,
+         scope       TEXT NOT NULL DEFAULT 'global',
+         confidence  REAL NOT NULL DEFAULT 1,
+         source      TEXT NOT NULL DEFAULT '',
+         created_at  INTEGER NOT NULL,
+         updated_at  INTEGER NOT NULL
+       )`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_subject_alias_unique
+         ON subject_alias(platform, alias, scope, subject_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_subject_alias_lookup
+         ON subject_alias(platform, alias, scope)`,
+
+      // --- profile 双层 scope：identity（全局打底，session_id=''）+ session
+      //     （会话覆盖）。存量行默认 'session' —— 计划口径「存量 (session_id,
+      //     subject_id) 迁移为 session scope」由默认值直接满足，无需数据搬运。 ---
+      `ALTER TABLE profile ADD COLUMN scope TEXT NOT NULL DEFAULT 'session'`,
+    ],
+  },
 ];
 
 function parseIdList(value) {
@@ -349,10 +399,27 @@ export function profileFromRow(row) {
     sessionId: row.session_id,
     platform: row.platform,
     subjectId: row.subject_id,
+    // v3 迁移前/旧行缺列时按会话层处理（存量口径）。
+    scope: row.scope ?? 'session',
     attributes: parseAttributes(row.attributes),
     confidence: Number(row.confidence ?? 0.5),
     sourceMsgIds: parseIdList(row.source_msg_ids),
     version: row.version,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function subjectAliasFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    platform: row.platform,
+    subjectId: row.subject_id,
+    alias: row.alias,
+    scope: row.scope,
+    confidence: Number(row.confidence ?? 1),
+    source: row.source ?? '',
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

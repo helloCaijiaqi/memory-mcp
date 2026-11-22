@@ -58,21 +58,59 @@ export function createProfileService({ store, logger = () => {}, now = Date.now 
     throw new Error('createProfileService 需要 store.profile 集合（sqlite / json 双实现）');
   }
 
-  const get = (sessionId, subjectId) => store.profile.get(sessionId, subjectId);
+  const hasIdentityLayer = () => typeof store.profile.getIdentity === 'function';
+  const platformOf = (sessionId) => {
+    const parts = String(sessionId ?? '').split(':');
+    return parts.length >= 3 ? parts[0].toLowerCase() : String(sessionId ?? '').toLowerCase();
+  };
+
+  /**
+   * 双层合并读（V2 统一改造）：identity 全局画像（platform+subject_id）打底，
+   * session 会话画像覆盖。无 identity 行（含 JSON 兜底后端）= 纯 session 行，
+   * 行为与旧版一致。attributes 冲突时 session 赢；confidence 取两层最大值。
+   */
+  function get(sessionId, subjectId) {
+    if (!subjectId) return null;
+    const session = store.profile.get(sessionId, subjectId);
+    const identity = hasIdentityLayer()
+      ? (store.profile.getIdentity(platformOf(sessionId), subjectId) ?? null)
+      : null;
+    if (!identity && !session) return null;
+    if (!identity) return session;
+    return {
+      subjectId,
+      platform: identity.platform,
+      scope: 'merged',
+      attributes: { ...(identity.attributes ?? {}), ...(session?.attributes ?? {}) },
+      confidence: Math.max(identity.confidence ?? 0.5, session?.confidence ?? 0.5),
+      sourceMsgIds: [...new Set([...(session?.sourceMsgIds ?? []), ...(identity.sourceMsgIds ?? [])])].slice(0, SOURCE_MAX),
+      version: session?.version ?? identity.version,
+      identityVersion: identity.version,
+      sessionVersion: session?.version ?? null,
+    };
+  }
+
   const list = (sessionId) => store.profile.list(sessionId);
   const history = (sessionId, subjectId, opts) => store.profile.history(sessionId, subjectId, opts);
   const count = () => store.profile.count();
 
   /**
-   * merge（摘要任务路径）：只覆盖本次给出的字段，未提及字段保留；null = 删除该
-   * 字段。confidence = 旧×0.7 + 新×0.3（无旧值 = 新值）；证据锚点并集去重截 200；
-   * version 自增。
+   * merge（摘要/save 事务路径）：只覆盖本次给出的字段，未提及字段保留；null =
+   * 删除该字段。confidence = 旧×0.7 + 新×0.3（无旧值 = 新值）；证据锚点并集去重
+   * 截 200；version 自增。scope='identity' 时写全局层（sessionId 不参与键）。
    */
-  function merge({ sessionId, subjectId, platform = '', patch = {}, confidence = 0.5, sourceMsgIds = [] } = {}) {
-    if (!sessionId || !subjectId) throw new Error('profile.merge 需要 sessionId 与 subjectId');
+  function merge({ sessionId, subjectId, platform = '', scope = 'session', patch = {}, confidence = 0.5, sourceMsgIds = [] } = {}) {
+    if (!subjectId) throw new Error('profile.merge 需要 subjectId');
+    if (scope !== 'session' && scope !== 'identity') throw new Error(`profile.merge scope 必须是 session|identity，got "${scope}"`);
+    if (scope === 'session' && !sessionId) throw new Error('profile.merge(session) 需要 sessionId');
+    if (scope === 'identity' && !platform && !sessionId) throw new Error('profile.merge(identity) 需要 platform 或 sessionId（派生）');
+    const identityScope = scope === 'identity';
+    const resolvedPlatform = platform || (identityScope ? platformOf(sessionId) : '');
     const { fields, dropped } = sanitize(patch);
     if (dropped.length) logger(`profile merge dropped out-of-whitelist fields: ${dropped.join(', ')}`);
-    const current = store.profile.get(sessionId, subjectId);
+    const current = identityScope && hasIdentityLayer()
+      ? store.profile.getIdentity(resolvedPlatform, subjectId)
+      : store.profile.get(sessionId, subjectId);
     const attributes = { ...(current?.attributes ?? {}) };
     for (const [key, value] of Object.entries(fields)) {
       if (value === null) {
@@ -88,9 +126,10 @@ export function createProfileService({ store, logger = () => {}, now = Date.now 
       : clamp01(confidence);
     const anchors = [...new Set([...(current?.sourceMsgIds ?? []), ...sourceMsgIds])].slice(0, SOURCE_MAX);
     return store.profile.put({
-      sessionId,
+      sessionId: identityScope ? '' : sessionId,
       subjectId,
-      platform: platform || current?.platform || '',
+      platform: resolvedPlatform,
+      scope,
       attributes,
       confidence: conf,
       sourceMsgIds: anchors,
@@ -99,12 +138,18 @@ export function createProfileService({ store, logger = () => {}, now = Date.now 
     });
   }
 
-  /** replace（运维路径）：整份覆盖，缺失字段即清空（人工修正人设）。 */
-  function replace({ sessionId, subjectId, platform = '', patch = {}, confidence = 1, sourceMsgIds = [] } = {}) {
-    if (!sessionId || !subjectId) throw new Error('profile.replace 需要 sessionId 与 subjectId');
+  /** replace（运维路径）：整份覆盖，缺失字段即清空（人工修正人设）。scope 语义同 merge。 */
+  function replace({ sessionId, subjectId, platform = '', scope = 'session', patch = {}, confidence = 1, sourceMsgIds = [] } = {}) {
+    if (!subjectId) throw new Error('profile.replace 需要 subjectId');
+    if (scope !== 'session' && scope !== 'identity') throw new Error(`profile.replace scope 必须是 session|identity，got "${scope}"`);
+    if (scope === 'session' && !sessionId) throw new Error('profile.replace(session) 需要 sessionId');
+    const identityScope = scope === 'identity';
+    const resolvedPlatform = platform || (identityScope ? platformOf(sessionId) : '');
     const { fields, dropped } = sanitize(patch);
     if (dropped.length) logger(`profile replace dropped out-of-whitelist fields: ${dropped.join(', ')}`);
-    const current = store.profile.get(sessionId, subjectId);
+    const current = identityScope && hasIdentityLayer()
+      ? store.profile.getIdentity(resolvedPlatform, subjectId)
+      : store.profile.get(sessionId, subjectId);
     const attributes = {};
     for (const [key, value] of Object.entries(fields)) {
       if (value === null) continue; // eslint-disable-line no-continue
@@ -112,9 +157,10 @@ export function createProfileService({ store, logger = () => {}, now = Date.now 
       if (!empty) attributes[key] = value;
     }
     return store.profile.put({
-      sessionId,
+      sessionId: identityScope ? '' : sessionId,
       subjectId,
-      platform: platform || current?.platform || '',
+      platform: resolvedPlatform,
+      scope,
       attributes,
       confidence: clamp01(confidence),
       sourceMsgIds: [...new Set(sourceMsgIds)].slice(0, SOURCE_MAX),

@@ -1,8 +1,8 @@
-// 网关 V2 P3 接入面：POST /v1/service/call（装饰器契约）+ POST /v1/tools/call（工具调用契约）。
+// 网关接入面：POST /v1/tools/call（tool.call 统一改造后的唯一服务间信封）。
 //
-// 这两个端点只服务于 agent-gateway（V2 管线）：memory-mcp 以「自主登记的装饰器
-// 服务」身份接入网关管线——记忆段注入走 service.call，模型侧的 chat_memory_*
-// 工具调用经网关 ToolHost 转发到 tools.call。桥接（qq-bridge 等）继续走 /api/*。
+// service.call 已全链路下线：记忆段注入（chat_memory_get，decorator）与会话缓冲
+// 落地（chat_memory_save）都走 tool.call 信封——网关管线步骤与 ToolHost 工具
+// 转发共用同一端点、同一信封、同一鉴权。桥接（qq-bridge 等）继续走 /api/*。
 //
 // 鉴权：网关出站 HMAC（agent-gateway auth.mjs v1 格式，与桥接的 x-mcp-token 并存、
 // 互不替代）：
@@ -40,18 +40,24 @@ export function createGatewayAuth({
   capacity = 100_000,
 } = {}) {
   if (typeof secret !== 'string' || secret.length < 16) {
-    throw new Error('createGatewayAuth 需要至少 16 字符的网关共享密钥（MEMORY_MCP_GATEWAY_SECRET）');
+    throw new Error('createGatewayAuth 需要至少 16 字符的网关共享密钥（来自仓库根目录 gateway.json 的 secret / secretFile）');
   }
   // serviceId 可选：不设则不比对 x-adapter-id（密钥仍是唯一凭据；设了更严——
   // 防止把给别的服务的请求拿到这里重放）。
   const seen = new Map();
+  // 密钥可热轮换（gateway.json 热加载）：HMAC 与 id 比对都读当前值，构造期
+  // 校验只管首份；rotate 时同样 fail-closed（非法密钥拒收，保留旧值）。
+  let currentSecret = secret;
+  let currentServiceId = serviceId;
   const sha256Hex = (body) => createHash('sha256').update(body ?? '', 'utf8').digest('hex');
-  const hmacHex = (payload) => createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
+  const hmacHex = (payload) => createHmac('sha256', currentSecret).update(payload, 'utf8').digest('hex');
 
   function prune(at) {
-    for (const [, expiresAt] of seen) {
-      if (expiresAt > at) break;
-      seen.delete(seen.keys().next().value);
+    // 2026-11-21 audit fix: while forward-scan (no monotonic assumption).
+    while (seen.size > 0) {
+      const [firstKey, firstExpires] = seen.entries().next().value;
+      if (firstExpires > at) break;
+      seen.delete(firstKey);
     }
     while (seen.size > capacity) seen.delete(seen.keys().next().value);
   }
@@ -64,7 +70,7 @@ export function createGatewayAuth({
       const nonce = headers['x-nonce'];
       const sigRaw = headers['x-signature'];
       if (!id || !tsRaw || !nonce || !sigRaw) throw new GatewayAuthError('缺少网关签名头');
-      if (serviceId && id !== serviceId) throw new GatewayAuthError('登记身份不匹配');
+      if (currentServiceId && id !== currentServiceId) throw new GatewayAuthError('登记身份不匹配');
       const ts = Number(tsRaw);
       if (!Number.isSafeInteger(ts) || Math.abs(now() - ts) > windowMs) {
         throw new GatewayAuthError('时间戳超出重放窗口');
@@ -79,6 +85,18 @@ export function createGatewayAuth({
       if (seen.has(key)) throw new GatewayAuthError('nonce 已使用（疑似重放）');
       seen.set(key, now() + windowMs);
       return { serviceId: id };
+    },
+
+    /**
+     * 原地轮换凭据（gateway.json 热加载用）：换 secret / serviceId，防重放
+     * nonce 表保留（窗口内旧 nonce 依然不能重放）。非法新值整体拒收。
+     */
+    rotate({ secret: nextSecret, serviceId: nextServiceId }) {
+      if (typeof nextSecret !== 'string' || nextSecret.length < 16) {
+        throw new Error('rotate 需要至少 16 字符的网关共享密钥');
+      }
+      currentSecret = nextSecret;
+      currentServiceId = nextServiceId;
     },
   };
 }
@@ -96,13 +114,11 @@ function requireText(value, field, max = 256) {
  * @param {object} deps.auth     createGatewayAuth 产物
  * @param {object} [deps.memory] memory service（record / forget / render）
  * @param {object} [deps.recall] recall router（recall）
- * @param {object} [deps.profile] profile service（chat_memory_profile 只读）
- * @param {object} [deps.relation] relation service（chat_memory_relation 只读）
+ * @param {object} [deps.subject] subject 身份层（名字 → subjectId 解析）
+ * @param {object} [deps.sessionSave] save 编排（chat_memory_save 唯一落地路径）
  * @param {Function} [deps.logger]
  */
-const PROFILE_FIELD_LABELS = { personality: '性格', speakingStyle: '说话风格', catchphrases: '口头禅', taboos: '禁忌', relation: '关系定位' };
-
-export function createGatewayV1({ auth, memory, recall, profile, relation, logger } = {}) {
+export function createGatewayV1({ auth, memory, recall, subject, sessionSave, logger } = {}) {
   const log = logger ?? (() => {});
 
   // ── 工具面：chat_memory_* → 内部 service 方法（与 /api/* 同一实现，不复制业务）──
@@ -111,14 +127,58 @@ export function createGatewayV1({ auth, memory, recall, profile, relation, logge
   // 安全边界（2026-11-09 修正）：工具参数由**模型生成**，提示注入可以让它塞任意
   // sessionId —— 因此这里一律以 ctx.sessionKey（网关从 turn 上下文注入）为准，
   // 忽略 args.sessionId。需要跨会话运维时走 /api/*（本机 token 通道），不走工具面。
+  // ctx：{ sessionKey, senderId?, text? } —— senderId 来自网关 context（在和谁对话），
+  // text 仅 filter 步骤下发（memory 无 filter 工具，不消费）。
   const tools = {
+    // ── decorator 步骤（网关管线编排；args 恒 {}，行为由 context 决定）───────
+    chat_memory_get: async (_args, ctx) => {
+      const sessionKey = requireText(ctx?.sessionKey, 'sessionKey', 256);
+      const subjectId = typeof ctx?.senderId === 'string' && ctx.senderId.trim()
+        ? ctx.senderId.trim().slice(0, 120) : '';
+      try {
+        const rendered = memory.render({ sessionId: sessionKey, subjectId });
+        // decorator 结果契约（tool.call 统一改造）：{ sections, epoch }——
+        // 纯注入，无改写无丢弃（改写/丢弃职责归 filter）。identity 块高优先级
+        //（预算超限时网关整段丢最低优先级——人格信息优先于长期碎片）。
+        const sections = (rendered?.blocks ?? [])
+          .filter((block) => typeof block?.text === 'string' && block.text.trim())
+          .map((block) => ({
+            name: block.name,
+            text: block.text,
+            priority: block.kind === 'identity' ? 90 : 50,
+          }));
+        return { sections, epoch: rendered?.epoch ?? null };
+      } catch (error) {
+        // 宁放行不误杀：装饰失败等价于「本轮没有记忆段」，网关管线同样 fail-safe。
+        log(`chat_memory_get 装饰失败（放行）：${error?.message ?? error}`);
+        return { sections: [], epoch: null };
+      }
+    },
+
+    // ── tool 步骤（模型可调 / 网关 session-save 直投）──────────────────────
+    chat_memory_save: async (args, ctx) => {
+      if (!sessionSave) throw new Error('session-save 编排未装配（检查 server.mjs）');
+      const sessionKey = requireText(ctx?.sessionKey, 'sessionKey', 256);
+      // sessionKey 强制取 ctx（防提示注入指定别的会话落地）；partial 由网关触顶
+      // 分段语义给出。整段缓冲 messages 形状见 service/session-save.js。
+      const messages = Array.isArray(args?.messages) ? args.messages : [];
+      if (messages.length === 0) throw new Error('chat_memory_save 需要 messages 数组（整段缓冲）');
+      return sessionSave.save({ sessionKey, messages, partial: args?.partial === true });
+    },
     chat_memory_recall: (args, ctx) => {
       if (!recall) throw new Error('recall 服务未装配（检查 server.mjs）');
+      const sessionKey = requireText(ctx?.sessionKey, 'sessionKey');
+      // subjectId 支持按名字解析（subject 身份层：群名片 → 全局昵称）；解析不到
+      // 按原样处理（可能是调用方直接传的稳定 id）。
+      let subjectId = args.subjectId;
+      if (subjectId && subject) {
+        subjectId = subject.resolve({ sessionId: sessionKey, alias: subjectId }) ?? subjectId;
+      }
       return recall.recall({
-        sessionId: requireText(ctx?.sessionKey, 'sessionKey'),
+        sessionId: sessionKey,
         text: String(args.text ?? ''),
         kinds: args.kinds,
-        subjectId: args.subjectId,
+        subjectId,
         limit: args.limit,
       });
     },
@@ -143,73 +203,11 @@ export function createGatewayV1({ auth, memory, recall, profile, relation, logge
         sessionId: requireText(ctx?.sessionKey, 'sessionKey'),
       });
     },
-    // ── 只读画像/关系工具（§6.4）：模型按需查「这个人是谁」，写入只走摘要守卫
-    // 与 /api/*（工具面无任何写入口，防提示注入改写人设/关系）。
-    chat_memory_profile: (args, ctx) => {
-      if (!profile) throw new Error('profile 服务未装配（检查 server.mjs）');
-      const sessionId = requireText(ctx?.sessionKey, 'sessionKey');
-      const subjectId = requireText(args.subjectId, 'subjectId', 120);
-      const doc = profile.get(sessionId, subjectId);
-      const versions = profile.history(sessionId, subjectId, { limit: 3 });
-      return {
-        subjectId,
-        profile: doc,
-        versions: versions.map((item) => ({ version: item.version, changedAt: item.changedAt })),
-        text: doc && Object.keys(doc.attributes ?? {}).length
-          ? Object.entries(doc.attributes).map(([key, value]) => `- ${PROFILE_FIELD_LABELS[key] ?? key}：${Array.isArray(value) ? value.join('、') : value}`).join('\n')
-          : '',
-      };
-    },
-    chat_memory_relation: (args, ctx) => {
-      if (!relation) throw new Error('relation 服务未装配（检查 server.mjs）');
-      const sessionId = requireText(ctx?.sessionKey, 'sessionKey');
-      const subjectId = requireText(args.subjectId, 'subjectId', 120);
-      const rows = relation
-        .list({ sessionId, subjectId, kind: args.kind, limit: Math.min(50, Math.max(1, Number(args.limit) || 20)) })
-        .filter((row) => row.confidence == null || row.confidence >= 0.4); // 与渲染同一降权口径
-      return {
-        subjectId,
-        rows,
-        text: rows.length
-          ? rows.map((row) => `- ${row.key}：${row.value}${row.confidence != null && row.confidence < 0.6 ? '（待确认）' : ''}`).join('\n')
-          : '',
-      };
-    },
   };
 
-  /**
-   * 装饰器：会话纪元记忆注入。verdict 恒 pass（decorator 不表达丢弃），出错只记日志不阻塞。
-   *
-   * 多 block + epoch 契约：senderId（网关从 turn 上下文透传，即「在和谁对话」）
-   * 决定 identity 块（画像+关系）；epoch 由服务端会话状态推进，网关按
-   * (sessionKey, subjectId, epoch) 去重实现「会话首轮注入一次」。sections 里
-   * 每项带 kind（identity=只在首轮 / long=首轮 + 可选按需），旧网关忽略 kind
-   * 也能正常拼接（多注入几次是幂等无害的 at-least-once）。
-   */
-  async function serviceCall(request) {
-    if (request.v !== 1) throw new Error('service.call 只支持 v=1');
-    requireText(request.callId, 'callId');
-    requireText(request.sessionKey, 'sessionKey', 256);
-    try {
-      const rendered = memory.render({
-        sessionId: request.sessionKey,
-        subjectId: typeof request.senderId === 'string' ? request.senderId.trim() : '',
-        maxChars: Number.isSafeInteger(request.maxChars) ? request.maxChars : undefined,
-      });
-      const sections = (rendered?.blocks ?? [])
-        .filter((block) => typeof block?.text === 'string' && block.text.trim())
-        .map((block) => ({ name: block.name, text: block.text, priority: 0, kind: block.kind }));
-      return { v: 1, callId: request.callId, verdict: 'pass', epoch: rendered?.epoch ?? null, sections };
-    } catch (error) {
-      // 宁放行不误杀：装饰失败等价于「本轮没有记忆段」，网关管线同样 fail-safe。
-      log(`service.call 装饰失败（放行）：${error?.message ?? error}`);
-      return { v: 1, callId: request.callId, verdict: 'pass', epoch: null, sections: [] };
-    }
-  }
-
-  /** 工具调用：业务失败以 ok:false 正常返回（HTTP 仍 200），网关 ToolHost 原样透传。 */
+  /** 工具调用（唯一信封）：业务失败以 ok:false 正常返回（HTTP 仍 200），网关原样透传。 */
   async function toolsCall(request) {
-    if (request.v !== 1) throw new Error('tools.call 只支持 v=1');
+    if (request.v !== 1) throw new Error('tool.call 只支持 v=1');
     requireText(request.callId, 'callId');
     const tool = requireText(request.tool, 'tool', 128);
     const handler = tools[tool];
@@ -220,8 +218,14 @@ export function createGatewayV1({ auth, memory, recall, profile, relation, logge
       };
     }
     const args = request.args && typeof request.args === 'object' ? request.args : {};
+    const context = request.context && typeof request.context === 'object' ? request.context : {};
+    const ctx = {
+      sessionKey: request.sessionKey,
+      senderId: context.senderId,
+      text: context.text,
+    };
     try {
-      const data = await handler(args, { sessionKey: request.sessionKey });
+      const data = await handler(args, ctx);
       return { v: 1, callId: request.callId, ok: true, data };
     } catch (error) {
       log(`tools.call ${tool} 业务失败：${error?.message ?? error}`);
@@ -232,14 +236,26 @@ export function createGatewayV1({ auth, memory, recall, profile, relation, logge
     }
   }
 
+  // ── 工具清单（GET /v1/tools；控制台「拉取清单预填」的数据源）────────────────
+  // 与上方 tools 分发表同源：增删工具必须同步维护本清单。role 是网关视角的
+  // 参考预填值（decorator=可进管线编排；登记文件里最终 role 由操作者确认）。
+  const TOOL_MANIFEST = [
+    { name: 'chat_memory_get', role: 'decorator', description: '按会话与对话对象渲染长期记忆为管线注入块（identity 高优先级）', inputSchema: { type: 'object' } },
+    { name: 'chat_memory_save', role: 'tool', description: '会话缓冲落库：规整消息、窗口哈希幂等、LLM 自动提取摘要/画像/关系', inputSchema: { type: 'object' } },
+    { name: 'chat_memory_recall', role: 'tool', description: '按查询意图检索长期记忆条目（话题/偏好/关系召回）', inputSchema: { type: 'object' } },
+    { name: 'chat_memory_record', role: 'tool', description: '写入单条长期记忆（显式「记住某件事」路径）', inputSchema: { type: 'object' } },
+    { name: 'chat_memory_forget', role: 'tool', description: '删除指定的长期记忆条目', inputSchema: { type: 'object' } },
+  ];
+
   const endpoints = new Map([
-    ['/v1/service/call', (request) => serviceCall(request)],
     ['/v1/tools/call', (request) => toolsCall(request)],
+    // GET /v1/tools：只读工具清单（rawBody 为空 → request={}，invoke 的对象检查天然通过）。
+    ['/v1/tools', () => ({ ok: true, tools: TOOL_MANIFEST })],
   ]);
 
   /**
-   * 分发（已鉴权的请求体）：HTTP 与 WS 两个入口共用。
-   * 帧入口（ws-connector）不重复验签——握手即鉴权，且 secret 只有网关与本服务知道。
+   * 分发（已鉴权的请求体）：HTTP 入口 handle 验签后进入；单独导出供测试直连。
+   * WS 帧入口已退役（传输按角色非对称：资源服务只走 HTTP tool.call）。
    */
   async function invoke({ path, request }) {
     const handler = endpoints.get(path);
@@ -259,7 +275,7 @@ export function createGatewayV1({ auth, memory, recall, profile, relation, logge
     /** 该服务的工具面清单（登记文件 tools[] 的服务端事实源）。 */
     toolNames: () => Object.keys(tools),
 
-    /** WS 帧入口：不验签（握手即鉴权），直接分发。 */
+    /** 分发入口：不重复验签（验签在 handle），供 HTTP handle 与测试使用。 */
     invoke,
 
     /**
@@ -268,7 +284,7 @@ export function createGatewayV1({ auth, memory, recall, profile, relation, logge
      * @returns {Promise<{status: number, body: object}>}
      */
     async handle({ path, headers, rawBody }) {
-      if (!auth) return { status: 503, body: { error: '网关接入未配置（MEMORY_MCP_GATEWAY_SECRET 未设置）' } };
+      if (!auth) return { status: 503, body: { error: '网关接入未配置（仓库根目录缺少 gateway.json）' } };
       try {
         auth.verify({ headers, rawBody });
       } catch (error) {

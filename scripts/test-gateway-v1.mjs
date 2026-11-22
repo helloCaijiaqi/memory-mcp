@@ -1,5 +1,5 @@
-// 网关 V2 接入面测试：/v1/service/call + /v1/tools/call（HMAC 鉴权、装饰器契约、
-// 工具路由、业务失败透传、nonce 防重放）。全离线：memory/recall 用假实现。
+﻿// 网关接入面测试：/v1/tools/call（tool.call 唯一信封：HMAC 鉴权、decorator 契约
+// {sections, epoch}、工具路由、业务失败透传、nonce 防重放）。全离线：memory/recall 用假实现。
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import http from 'node:http';
@@ -30,9 +30,10 @@ function signRequest({ secret, adapterId, body, timestamp = Date.now(), nonce = 
 }
 
 const fakeMemory = {
-  render({ sessionId }) {
-    assert.ok(sessionId.startsWith('qq:'), '装饰器收到 platform:scope:id 形 sessionId');
-    return { blocks: [{ name: '记忆', text: '【记忆】\n测试记忆段', chars: 12 }] };
+  render({ sessionId, subjectId }) {
+    assert.ok(sessionId.startsWith('qq:'), 'decorator 收到 platform:scope:id 形 sessionId');
+    fakeMemory.lastSubjectId = subjectId ?? '';
+    return { blocks: [{ name: '记忆', text: '【记忆】\n测试记忆段', kind: 'long', chars: 12 }], epoch: 3 };
   },
   async record(args) {
     assert.ok(args.content, 'record 需要 content');
@@ -68,9 +69,10 @@ function post(port, path, { headers = {}, body = '' }) {
   });
 }
 
-const serviceCallBody = JSON.stringify({
-  v: 1, callId: 'svc-1', service: REG_ID, step: 'chat_memory_recall', kind: 'decorator',
-  sessionKey: 'qq:group:123', text: '用户消息',
+// decorator 形态的 tool.call：args 恒 {}，context.senderId 决定 identity 主体。
+const decoratorCallBody = JSON.stringify({
+  v: 1, callId: 'svc-1', tool: 'chat_memory_get', args: {},
+  sessionKey: 'qq:group:123', context: { senderId: 'u_1' },
 });
 const toolCallBody = JSON.stringify({
   v: 1, callId: 'tool-1', tool: 'chat_memory_recall', args: { text: '旅行' }, sessionKey: 'qq:group:123',
@@ -87,45 +89,48 @@ const { port } = await api.listen();
 
 try {
   await check('未签名请求 → 401', async () => {
-    const res = await post(port, '/v1/service/call', { body: serviceCallBody });
+    const res = await post(port, '/v1/tools/call', { body: decoratorCallBody });
     assert.equal(res.status, 401);
   });
 
   await check('错误密钥 → 401', async () => {
-    const res = await post(port, '/v1/service/call', {
-      headers: signRequest({ secret: 'wrong-secret-0123456789', adapterId: REG_ID, body: serviceCallBody }),
-      body: serviceCallBody,
+    const res = await post(port, '/v1/tools/call', {
+      headers: signRequest({ secret: 'wrong-secret-0123456789', adapterId: REG_ID, body: decoratorCallBody }),
+      body: decoratorCallBody,
     });
     assert.equal(res.status, 401);
   });
 
   await check('身份头与登记 id 不匹配 → 401', async () => {
-    const res = await post(port, '/v1/service/call', {
-      headers: signRequest({ secret: SECRET, adapterId: 'other-service', body: serviceCallBody }),
-      body: serviceCallBody,
+    const res = await post(port, '/v1/tools/call', {
+      headers: signRequest({ secret: SECRET, adapterId: 'other-service', body: decoratorCallBody }),
+      body: decoratorCallBody,
     });
     assert.equal(res.status, 401);
   });
 
   await check('nonce 重放 → 401', async () => {
-    const headers = signRequest({ secret: SECRET, adapterId: REG_ID, body: serviceCallBody });
-    const first = await post(port, '/v1/service/call', { headers, body: serviceCallBody });
+    const headers = signRequest({ secret: SECRET, adapterId: REG_ID, body: decoratorCallBody });
+    const first = await post(port, '/v1/tools/call', { headers, body: decoratorCallBody });
     assert.equal(first.status, 200);
-    const second = await post(port, '/v1/service/call', { headers, body: serviceCallBody });
+    const second = await post(port, '/v1/tools/call', { headers, body: decoratorCallBody });
     assert.equal(second.status, 401);
   });
 
-  await check('service/call：装饰器契约（verdict=pass + sections）', async () => {
-    const res = await post(port, '/v1/service/call', {
-      headers: signRequest({ secret: SECRET, adapterId: REG_ID, body: serviceCallBody }),
-      body: serviceCallBody,
+  await check('tools/call：decorator 契约（ok + sections + epoch，context.senderId 下传）', async () => {
+    const res = await post(port, '/v1/tools/call', {
+      headers: signRequest({ secret: SECRET, adapterId: REG_ID, body: decoratorCallBody }),
+      body: decoratorCallBody,
     });
     assert.equal(res.status, 200);
     assert.equal(res.body.v, 1);
     assert.equal(res.body.callId, 'svc-1');
-    assert.equal(res.body.verdict, 'pass');
-    assert.equal(res.body.sections[0].name, '记忆');
-    assert.ok(res.body.sections[0].text.includes('测试记忆段'));
+    assert.equal(res.body.ok, true);
+    assert.equal(fakeMemory.lastSubjectId, 'u_1', 'context.senderId 必须传给 render');
+    assert.equal(res.body.data.epoch, 3);
+    assert.equal(res.body.data.sections[0].name, '记忆');
+    assert.ok(res.body.data.sections[0].text.includes('测试记忆段'));
+    assert.equal(res.body.data.sections[0].priority, 50, 'long 块中等优先级');
   });
 
   await check('tools/call：chat_memory_recall 路由到 recall', async () => {
@@ -223,6 +228,53 @@ try {
 } finally {
   await api.close();
 }
+
+// ── 热加载：auth.rotate 原地换密钥（gateway.json 热加载的地基）─────────────────
+await check('rotate：换密钥后旧签名 401、新签名通过', async () => {
+  const auth = createGatewayAuth({ secret: SECRET, serviceId: REG_ID });
+  const gateway = createGatewayV1({ auth, memory: fakeMemory, recall: fakeRecall });
+  const oldSig = signRequest({ secret: SECRET, adapterId: REG_ID, body: decoratorCallBody });
+  assert.equal((await gateway.handle({ path: '/v1/tools/call', headers: oldSig, rawBody: decoratorCallBody })).status, 200);
+
+  const NEXT = 'rotated-shared-secret-0123456789';
+  auth.rotate({ secret: NEXT, serviceId: REG_ID });
+  // 旧密钥签名（换掉 secret 但换新 nonce）→ 401：密钥真的换掉了。
+  const stale = signRequest({ secret: SECRET, adapterId: REG_ID, body: decoratorCallBody });
+  assert.equal((await gateway.handle({ path: '/v1/tools/call', headers: stale, rawBody: decoratorCallBody })).status, 401);
+  // 新密钥签名 → 200；业务 handler 未重建（同一个 gateway 实例继续工作）。
+  const fresh = signRequest({ secret: NEXT, adapterId: REG_ID, body: decoratorCallBody });
+  assert.equal((await gateway.handle({ path: '/v1/tools/call', headers: fresh, rawBody: decoratorCallBody })).status, 200);
+});
+
+await check('rotate：serviceId 一并轮换；过短密钥整体拒收（保留旧值）', async () => {
+  const auth = createGatewayAuth({ secret: SECRET, serviceId: 'id-a' });
+  const gateway = createGatewayV1({ auth, memory: fakeMemory, recall: fakeRecall });
+  const otherIdBody = decoratorCallBody;
+  // id-a 期间用 id-b 签名 → 身份不匹配 401。
+  const wrongId = signRequest({ secret: SECRET, adapterId: 'id-b', body: otherIdBody });
+  assert.equal((await gateway.handle({ path: '/v1/tools/call', headers: wrongId, rawBody: otherIdBody })).status, 401);
+
+  assert.throws(() => auth.rotate({ secret: 'short' }), /至少 16 字符/);
+  // 拒收后旧值仍在：id-a + 旧密钥照常通过。
+  const stillOld = signRequest({ secret: SECRET, adapterId: 'id-a', body: otherIdBody });
+  assert.equal((await gateway.handle({ path: '/v1/tools/call', headers: stillOld, rawBody: otherIdBody })).status, 200);
+
+  auth.rotate({ secret: SECRET, serviceId: 'id-b' });
+  const withNewId = signRequest({ secret: SECRET, adapterId: 'id-b', body: otherIdBody });
+  assert.equal((await gateway.handle({ path: '/v1/tools/call', headers: withNewId, rawBody: otherIdBody })).status, 200);
+});
+
+await check('rotate：换密钥不重置防重放 nonce 窗口', async () => {
+  const auth = createGatewayAuth({ secret: SECRET, serviceId: REG_ID });
+  const gateway = createGatewayV1({ auth, memory: fakeMemory, recall: fakeRecall });
+  const nonce = crypto.randomBytes(12).toString('hex');
+  const headers = signRequest({ secret: SECRET, adapterId: REG_ID, body: decoratorCallBody, nonce });
+  assert.equal((await gateway.handle({ path: '/v1/tools/call', headers, rawBody: decoratorCallBody })).status, 200);
+  auth.rotate({ secret: 'rotated-shared-secret-0123456789', serviceId: REG_ID });
+  // 同一 nonce 用新密钥重签 → 依然 401：轮换不重置防重放窗口。
+  const replay = signRequest({ secret: 'rotated-shared-secret-0123456789', adapterId: REG_ID, body: decoratorCallBody, nonce });
+  assert.equal((await gateway.handle({ path: '/v1/tools/call', headers: replay, rawBody: decoratorCallBody })).status, 401);
+});
 
 console.log(`\nℹ tests ${passed + failed}\nℹ pass ${passed}\nℹ fail ${failed}`);
 process.exitCode = failed > 0 ? 1 : 0;

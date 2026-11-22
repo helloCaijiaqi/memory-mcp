@@ -13,9 +13,10 @@ import { createFts5Backend, createRecallRouter, createVectorBackend } from './se
 import { createPlatformPolicy } from './service/platform-policy.js';
 import { createSlangService } from './service/slang-service.js';
 import { createGatewayAuth, createGatewayV1 } from './service/gateway-v1.js';
-import { createGatewayWsConnector } from './service/ws-connector.js';
+import { createGatewayWatcher } from './gateway-watch.js';
 import { createProfileService } from './service/profile-service.js';
-import { createSummarizer } from './service/summarizer.js';
+import { createSubjectService } from './service/subject-service.js';
+import { createSessionSave } from './service/session-save.js';
 import { createRelationGuard } from './service/relation-guard.js';
 import { createLlmProvider } from './llm-provider.js';
 import { createHttpApi } from './http-api.js';
@@ -33,6 +34,57 @@ function num(value, fallback) {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
+// ── LLM 提取配置（2026-11-18）：根目录 llm.config.json 为默认，显式 env 覆盖 ──
+// 文件字段用驼峰（enabled/baseUrl/apiKey/model/timeoutMs），真实文件含 apiKey、
+// 已入 .gitignore（同 gateway.json 模式）；示例见 llm.config.example.json。
+const LLM_FILE_FIELDS = [
+  ['MEMORY_MCP_LLM_ENABLED', 'enabled'],
+  ['MEMORY_MCP_LLM_BASE_URL', 'baseUrl'],
+  ['MEMORY_MCP_LLM_API_KEY', 'apiKey'],
+  ['MEMORY_MCP_LLM_MODEL', 'model'],
+  ['MEMORY_MCP_LLM_TIMEOUT_MS', 'timeoutMs'],
+];
+
+function loadLlmFileConfig() {
+  try {
+    const raw = fs.readFileSync(path.join(PKG_ROOT, 'llm.config.json'), 'utf8');
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      // 告警走 stderr（stdout 是 MCP 协议通道）；fail-open 不挡启动。
+      console.error(`[memory-mcp] llm.config.json 解析失败（忽略文件，回退 env/默认值）：${error?.message ?? error}`);
+    }
+    return {};
+  }
+}
+
+function resolveLlmConfig(env, warn) {
+  const file = loadLlmFileConfig();
+  const merged = {};
+  let hasEnv = false;
+  let hasFile = false;
+  for (const [envKey, fileKey] of LLM_FILE_FIELDS) {
+    const envValue = env[envKey];
+    const fileValue = file[fileKey];
+    if (envValue != null) hasEnv = true;
+    if (fileValue !== undefined) hasFile = true;
+    // env 显式残留会静默压过文件（曾 setx 过是常见来源），冲突即告警提示清理。
+    if (envValue != null && fileValue !== undefined && String(envValue) !== String(fileKey === 'apiKey' ? '***' : fileValue)) {
+      warn(`${envKey}（env）压过 llm.config.json 的 ${fileKey}——环境变量残留建议清理`);
+    }
+    merged[fileKey] = envValue ?? fileValue;
+  }
+  return {
+    enabled: merged.enabled === true || String(merged.enabled ?? '') === '1',
+    baseUrl: merged.baseUrl ?? '',
+    apiKey: merged.apiKey ?? '',
+    model: merged.model ?? '',
+    timeoutMs: num(merged.timeoutMs, 20_000),
+    source: hasEnv ? 'env' : (hasFile ? 'file' : 'none'),
+  };
+}
+
 export function resolveConfig(env = process.env) {
   // MEMORY_MCP_DATA_DIR 是文档里的旧名字：两个都认，避免升级后旧部署「换了目录还不自知」。
   const stateDir = path.resolve(env.MEMORY_MCP_STATE_DIR ?? env.MEMORY_MCP_DATA_DIR ?? path.join(PKG_ROOT, 'state'));
@@ -45,22 +97,10 @@ export function resolveConfig(env = process.env) {
     host: '127.0.0.1',
     token: env.MEMORY_MCP_TOKEN ?? '',
     readonlyTokenFile: path.join(stateDir, 'http-token'),
-    // 网关 V2 接入（/v1 端点）：secret 与网关登记文件的 secret 同源（推荐
-    // secretEnv: MEMORY_MCP_GATEWAY_SECRET）；gatewayId = 登记文件 id（32 位
-    // hash，可选——不设则只验签名不比对身份头，密钥仍是唯一凭据）。
-    gatewaySecret: env.MEMORY_MCP_GATEWAY_SECRET ?? '',
-    gatewayId: env.MEMORY_MCP_GATEWAY_ID ?? '',
-    // 网关 WS 长连接（V2 主线）：URL 非空即启用连接器（service.call / tool.call 走帧）。
-    // transport 只允许 ws|auto（fail-closed：非法值启动即失败）；权威选路仍在网关
-    // service-registry（登记文件 transport 字段），这里只是连接器口径。
-    gatewayWsUrl: env.MEMORY_MCP_GATEWAY_WS_URL ?? '',
-    gatewayTransport: (() => {
-      const value = env.MEMORY_MCP_GATEWAY_TRANSPORT ?? 'auto';
-      if (value !== 'ws' && value !== 'auto') {
-        throw new Error(`MEMORY_MCP_GATEWAY_TRANSPORT 只支持 ws|auto（got "${value}"）`);
-      }
-      return value;
-    })(),
+    // 网关接入：唯一来源是仓库根目录的 gateway.json——但不再在 resolveConfig
+    // 里读取（启动期一次性绑定是「注册后必须重启」的根源）。改由 start() 里的
+    // createGatewayWatcher 热加载：文件出现/修复/变更 ≤2s 自动生效。旧
+    // *_GATEWAY_* 环境变量已退役，设置了会直接报错（检测挪进 watcher）。
     // head 断点与情绪时效：两个服务共用同一组数字，不允许各配各的。
     head: {
       quietWindowMs: num(env.MEMORY_MCP_HEAD_QUIET_MINUTES, 30) * MINUTE_MS,
@@ -80,20 +120,10 @@ export function resolveConfig(env = process.env) {
     raw: {
       rawRetentionDays: num(env.MEMORY_MCP_RAW_RETENTION_DAYS, 30),
     },
-    // LLM（OpenAI 兼容）：黑话解释 + 失活摘要共用一个 provider。默认关闭 ——
-    // 关闭时摘要任务不跑（长期层只由 record/手动巩固产生），行为与旧版一致。
-    llm: {
-      enabled: String(env.MEMORY_MCP_LLM_ENABLED ?? '') === '1',
-      baseUrl: env.MEMORY_MCP_LLM_BASE_URL ?? '',
-      apiKey: env.MEMORY_MCP_LLM_API_KEY ?? '',
-      model: env.MEMORY_MCP_LLM_MODEL ?? '',
-      timeoutMs: num(env.MEMORY_MCP_LLM_TIMEOUT_MS, 20_000),
-    },
-    // 失活摘要：quietMs 必须与会话纪元的 sessionIdleMs 同源（60 分钟 = 会话结束）。
-    summary: {
-      quietMs: num(env.MEMORY_MCP_SUMMARY_QUIET_MINUTES, 60) * MINUTE_MS,
-      tickMs: num(env.MEMORY_MCP_SUMMARY_TICK_MINUTES, 5) * MINUTE_MS,
-    },
+    // LLM（OpenAI 兼容）：黑话解释 + save 摘要共用一个 provider。默认关闭 ——
+    // 关闭时 chat_memory_save 跳过摘要/画像/关系步骤（raw + alias + 纪元照常
+    // 落地），长期层退化为「record / 手动巩固」，行为与旧版一致。
+    llm: resolveLlmConfig(env, (msg) => console.error(`[memory-mcp] ${msg}`)),
     memory: {
       sessionIdleMs: num(env.MEMORY_MCP_SESSION_IDLE_MINUTES, 60) * MINUTE_MS,
     },
@@ -140,7 +170,15 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
     logger: log,
   });
 
-  const memory = createMemoryService({ store, config: { head: cfg.head, sessionIdleMs: cfg.memory.sessionIdleMs }, platformPolicy });
+  // 人物画像服务先于 memory 装配（memory.render 的 identity 块用双层合并读：
+  // identity 全局打底 + session 会话覆盖，见 profile-service.get）。
+  const profile = createProfileService({ store, logger: log });
+  const memory = createMemoryService({
+    store,
+    profile,
+    config: { head: cfg.head, sessionIdleMs: cfg.memory.sessionIdleMs },
+    platformPolicy,
+  });
   const slang = createSlangService({ store });
   const relation = createRelationService({
     store,
@@ -148,28 +186,36 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
     platformPolicy,
   });
   const raw = createRawService({ store, stateDir: cfg.stateDir, config: cfg.raw, logger: { log } });
-  // 人物画像 + 失活摘要（会话纪元模型）：LLM 关闭时 summarizer.enabled=false，
-  // tick 直接空转 —— 长期层退化为「record / 手动巩固」，与旧版行为一致。
   const llm = createLlmProvider(cfg.llm);
-  const profile = createProfileService({ store, logger: log });
+  // subject 身份层 + session-save 编排（tool.call 统一改造）：网关经 tool.call
+  // chat_memory_save 投递整段缓冲，单事务落地 raw/别名/摘要/画像/关系并推进纪元；
+  // 内部空闲摘要调度器已删除，落地时机完全由网关裁决。
+  // SQLite 降级到 JSON 兜底时（无 subject_alias 集合）save 面缺席：gateway-v1 的
+  // chat_memory_save 会按业务失败返回，网关缓冲退避重试——绝不在降级后端上假落地。
+  const subject = store.subjectAlias ? createSubjectService({ store, logger: log }) : null;
+  const sessionSave = subject
+    ? createSessionSave({
+      store,
+      memory,
+      subject,
+      profile,
+      // save 抽取的 relations + 窗口原文（规则兜底用）→ 守卫处理；save 事务不受
+      // 守卫结果影响（守卫永不抛错，失败逐条进 pending/日志）。
+      guard: {
+        handleExtracted: ({ sessionId, relations, sourceMsgIds, windowHash, rows }) => {
+          const results = guard.handleExtracted({ sessionId, relations, sourceMsgIds, windowHash, rows });
+          const pending = results.filter((item) => item.outcome === 'pending').length;
+          if (pending) log(`save 关系抽取：${results.length} 条候选，其中 ${pending} 条待人工确认`);
+          return results;
+        },
+      },
+      llm,
+      logger: log,
+    })
+    : null;
+  if (!sessionSave) log('警告：存储降级（无 subject_alias 集合），chat_memory_save 不可用——网关缓冲将保留重试');
   // 关系守卫：摘要抽取 + 规则兜底的唯一写入通道（阈值/白名单/pending 在这层强制）。
   const guard = createRelationGuard({ store, relation, logger: log });
-  const summarizer = createSummarizer({
-    store,
-    memory,
-    profile,
-    llm,
-    // 摘要抽取的 relations + 窗口原文（规则兜底用）→ 守卫处理；摘要事务不受
-    // 守卫结果影响（守卫永不抛错，失败逐条记录）。
-    onRelations: ({ sessionId, relations, sourceMsgIds, windowHash, rows }) => {
-      const results = guard.handleExtracted({ sessionId, relations, sourceMsgIds, windowHash, rows });
-      const pending = results.filter((item) => item.outcome === 'pending').length;
-      if (pending) log(`摘要抽取：${results.length} 条候选，其中 ${pending} 条待人工确认`);
-      return results;
-    },
-    config: { quietMs: cfg.summary.quietMs, tickMs: cfg.summary.tickMs },
-    logger: log,
-  });
   // 召回后端按能力装配：FTS5 现在可用，向量是占位（available() === false，不拖慢热路径）。
   const recall = createRecallRouter({
     store,
@@ -177,37 +223,62 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
     config: cfg.recall,
   });
 
-  // 网关 V2 接入面：配了密钥才创建（未配 = /v1 端点整体缺席，网关侧按「服务
-  // 未就绪」降级）。auth 失败只 401，不影响 /api/* 与 stdio。
-  const gateway = cfg.gatewaySecret
-    ? createGatewayV1({
-      auth: createGatewayAuth({ secret: cfg.gatewaySecret, serviceId: cfg.gatewayId || undefined }),
-      memory,
-      recall,
-      profile,
-      relation,
-      logger: log,
-    })
-    : null;
+  // 网关接入面（热加载）：gateway.json 出现/修复/变更 ≤2s 自动生效，无需重启。
+  // /v1/tools/call 常挂载——未生效时返回 503 带文案，而不是端点整体缺席。
+  // auth 失败只 401，不影响 /api/* 与 stdio。
+  const gatewayWatcher = createGatewayWatcher({ root: PKG_ROOT, env, envPrefix: 'MEMORY_MCP_', logger: log });
 
-  // 网关 WS 长连接：配置了 URL 就必须给齐 id/secret（fail-closed，不静默退回 HTTP——
-  // 「以为走了 WS 其实没连」比启动失败更难排查）。连接器挂 `invoke`（免验签分发，
-  // 与 HTTP 入口同一组处理函数），帧到达即执行并回应。
-  if (cfg.gatewayWsUrl) {
-    if (!cfg.gatewaySecret) throw new Error('MEMORY_MCP_GATEWAY_WS_URL 已设置，但缺少 MEMORY_MCP_GATEWAY_SECRET');
-    if (!cfg.gatewayId) throw new Error('MEMORY_MCP_GATEWAY_WS_URL 已设置，但缺少 MEMORY_MCP_GATEWAY_ID（登记文件 id）');
-    if (!gateway) throw new Error('网关 WS 连接器需要 /v1 接入面（gateway-v1）已装配');
-  }
-  const wsConnector = gateway && cfg.gatewayWsUrl
-    ? createGatewayWsConnector({
-      url: cfg.gatewayWsUrl,
-      serviceId: cfg.gatewayId,
-      secret: cfg.gatewaySecret,
-      transport: cfg.gatewayTransport,
-      invoke: gateway.invoke,
-      logger: log,
-    })
-    : null;
+  // 内部 handler 惰性装配：首个有效配置出现时创建（auth 持有 nonce 防重放表）；
+  // 之后配置变更走 auth.rotate 原地换密钥——防重放窗口不重置，业务依赖不重建。
+  let gatewayInner = null;
+  let gatewayAuthHandle = null;
+  const ensureGatewayHandler = (config) => {
+    if (!gatewayInner) {
+      gatewayAuthHandle = createGatewayAuth({ secret: config.secret, serviceId: config.id || undefined });
+      gatewayInner = createGatewayV1({
+        auth: gatewayAuthHandle,
+        memory,
+        recall,
+        subject,
+        sessionSave,
+        logger: log,
+      });
+    } else {
+      gatewayAuthHandle.rotate({ secret: config.secret, serviceId: config.id || undefined });
+    }
+    return gatewayInner;
+  };
+
+  // 传输按角色非对称：资源服务纯被动（网关 → 本服务的 HTTP tool.call 是唯一
+  // 通道，WS 能力已退役），接入生效就必须给齐 id/secret（tool.call 验签要）。
+  // 读取器 + watcher 已保证 config 存在时字段齐全，这里不再兜装配顺序的底。
+  const gateway = {
+    async handle({ path, headers, rawBody }) {
+      const { config, error } = gatewayWatcher.current();
+      if (!config) {
+        return {
+          status: 503,
+          body: {
+            error: `网关接入未生效（${error ? `gateway.json 非法：${error}` : '未找到 gateway.json'}）。`
+              + '把网关生成的 handoff/<id>.gateway.json 复制到本仓库根目录命名 gateway.json，'
+              + '≤2s 自动热加载，无需重启。',
+          },
+        };
+      }
+      return ensureGatewayHandler(config).handle({ path, headers, rawBody });
+    },
+  };
+
+  const initialGateway = gatewayWatcher.current();
+  log(initialGateway.config
+    ? `网关接入：${initialGateway.file}（id=${initialGateway.config.id} auth=${initialGateway.config.auth} `
+      + `transport=${initialGateway.config.transport}；热加载 ≤2s，无需重启）`
+    : `网关接入：未生效（${initialGateway.error ? `gateway.json 非法：${initialGateway.error}` : '未找到 gateway.json'}）；`
+      + '放入/修复后自动热加载，无需重启；stdio MCP 照常可用');
+  // LLM 提取状态直接进启动日志与 health：排障时第一眼可见 provider 是否启用。
+  log(cfg.llm.enabled
+    ? `LLM 提取已启用：model=${cfg.llm.model} baseUrl=${cfg.llm.baseUrl}（来源=${cfg.llm.source}）`
+    : `LLM 提取未启用（来源=${cfg.llm.source}）——chat_memory_save 只落 raw，长期层退化为 record/手动巩固`);
 
   // 健康检查要能看见「降级到 JSON 兜底」「库是只读」这两件事实，而不是只写进日志。
   const info = {
@@ -218,6 +289,23 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
     schemaVersion: store.schemaVersion ?? null,
     archiveDir: path.relative(cfg.stateDir, raw.root) || '.',
     layersV2: cfg.layersV2,
+    // LLM 提取 provider 状态（不含 apiKey）：enabled=false 时 save 只落 raw。
+    llm: { enabled: cfg.llm.enabled, model: cfg.llm.model, baseUrl: cfg.llm.baseUrl, source: cfg.llm.source },
+    // 网关接入状态（动态 getter）：热加载后 configured/id 跟着变——排障时第一个
+    // 要确认的「到底读没读到 gateway.json、现在生效的是哪份身份」。
+    get gateway() {
+      const g = gatewayWatcher.current();
+      return g.config
+        ? {
+          configured: true,
+          hotReload: true,
+          file: g.file,
+          auth: g.config.auth,
+          transport: g.config.transport,
+          id: g.config.id,
+        }
+        : { configured: false, hotReload: true, file: g.file, lastError: g.error };
+    },
     platforms: { known: platformPolicy.known, strict: platformPolicy.strict },
     recall: {
       backends: recall.backends,
@@ -260,29 +348,18 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
       log(`回环 HTTP 未启动（${error.code} ${cfg.host}:${cfg.port}）：已降级为 stdio-only，MCP 工具仍可用；qq-bridge 将回落本地实现`);
     }
   }
-  if (wsConnector) {
-    // 与本地 HTTP 端口无关：即使回环端口被占（stdio-only 降级），WS 长连接仍可工作
-    // ——网关的 service.call / tool.call 因此不会因为本服务端口冲突而全部走不通。
-    wsConnector.start();
-    const status = wsConnector.status();
-    log(`网关 WS 连接器已启动：${status.endpoint}（service=${status.serviceId} transport=${status.transport}）`);
-  }
-  // 失活摘要 tick（LLM 启用时才有实际动作；定时器 unref，不拖住进程退出）。
-  if (summarizer.status().enabled) {
-    summarizer.start();
-    log(`失活摘要任务已启动：quiet=${Math.round(cfg.summary.quietMs / MINUTE_MS)}min tick=${Math.round(cfg.summary.tickMs / MINUTE_MS)}min`);
-  }
-  // 统一退出路径：停摘要 → 停连接器 → 关 HTTP → 关 SQLite 句柄 → exit。
-  // 旧实现每个模块各自 process.once('SIGINT')，只 stop 连接器就返回：stdio 模式下
+  // 统一退出路径：关 HTTP → 关 SQLite 句柄 → exit。
+  // 旧实现每个模块各自 process.once('SIGINT')：stdio 模式下
   // stdin 还开着，进程不退出；SQLite 的 WAL/句柄也没有正常关闭点。
+  // 摘要调度器已删除：save 的落地时机完全由网关裁决（网关关停补发 → 缓冲重试），
+  // 本服务关停时无需任何补发动作。
   let shuttingDown = false;
   const shutdown = async (signal) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    log(`收到 ${signal}，正在关闭（summary/ws/http/store）…`);
-    try { summarizer.stop(); } catch { /* 已停 */ }
-    try { wsConnector?.stop(); } catch { /* 已停 */ }
+    log(`收到 ${signal}，正在关闭（http/store）…`);
     try { if (api && !httpError) await api.close(); } catch { /* 已关 */ }
+    try { gatewayWatcher.stop(); } catch { /* 已关 */ }
     try { store.close?.(); } catch { /* 已关 */ }
     process.exit(0);
   };
@@ -292,7 +369,7 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
     await serveStdio({ memory, slang, relation, raw, recall });
     log('stdio MCP 已连接');
   }
-  return { cfg, store, memory, slang, relation, raw, recall, profile, guard, summarizer, llm, api: httpError ? null : api, token, httpError, info, wsConnector };
+  return { cfg, store, memory, slang, relation, raw, recall, profile, subject, sessionSave, guard, llm, api: httpError ? null : api, token, httpError, info, gatewayWatcher };
 }
 
 const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

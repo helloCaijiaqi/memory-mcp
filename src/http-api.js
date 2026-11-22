@@ -88,8 +88,8 @@ export function createHttpApi({
   guard,
   info,
   token,
-  // 网关 V2 接入面（createGatewayV1 产物）：/v1/service/call + /v1/tools/call。
-  // 未传 = 两个端点不存在（404），桥接与 DSH 的既有路径不受影响。
+  // 网关 V2 接入面（createGatewayV1 产物）：/v1/tools/call（tool.call 唯一信封）。
+  // 未传 = 端点不存在（404），桥接与 DSH 的既有路径不受影响。
   gateway,
   host = '127.0.0.1',
   port = 7181,
@@ -175,8 +175,9 @@ export function createHttpApi({
       }
       const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
       // 网关 V2 端点：验签要原始 body，所以先于通用 readBody 分支（不走 x-mcp-token 通道）。
-      if (gateway && (path === '/v1/service/call' || path === '/v1/tools/call')) {
-        if (req.method !== 'POST') {
+      // /v1/tools（GET 只读清单，空 body 签名）与 /v1/tools/call（POST 调用信封）共用验签通道。
+      if (gateway && (path === '/v1/tools/call' || path === '/v1/tools')) {
+        if (req.method !== (path === '/v1/tools' ? 'GET' : 'POST')) {
           json(res, 405, { error: `不支持的方法：${req.method}` });
           return;
         }

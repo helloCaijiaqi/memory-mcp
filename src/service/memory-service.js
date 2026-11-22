@@ -28,7 +28,11 @@ export const DEFAULT_MEMORY_CONFIG = {
   head: { ...DEFAULT_HEAD_CONFIG },
 };
 
-export function createMemoryService({ store, config = {}, platformPolicy } = {}) {
+/**
+ * @param {object} [profile] profile 服务（V2 统一改造：双层 scope 合并读）。
+ *   缺省时 render 回退 store.profile 单层行（旧口径，JSON 兜底后端兼容）。
+ */
+export function createMemoryService({ store, config = {}, platformPolicy, profile = null } = {}) {
   if (!store) throw new Error('createMemoryService 需要 store');
   // 平台白名单只在写入前校验一次：读路径放行（未知平台本来就查不到东西，不该抛错）。
   const checkPlatform = (sessionId) => {
@@ -51,21 +55,14 @@ export function createMemoryService({ store, config = {}, platformPolicy } = {})
   };
 
   /**
-   * 会话纪元解析：读 last_activity_at 判静默；静默 ≥ sessionIdleMs 就 CAS 推进
-   * epoch（本调用 = 新会话首轮），无论推进与否都 touchActivity 记活跃。返回当前
-   * epoch；存储不支持会话状态时返回 null（调用方按「无纪元」处理，功能降级不报错）。
+   * 会话纪元读（V2 统一改造：读路径不再推进）。epoch 推进点已迁到 save 事务
+   * （session-save.js：会话收尾 save = 新纪元），落地时机完全由网关裁决——
+   * render 只读当前值；读路径的 touchActivity 同步删除（活跃触点由 ingest/save
+   * 维护，render 高频读不该刷新失活窗口）。存储不支持会话状态时返回 null。
    */
-  function resolveEpoch(sessionId) {
-    if (typeof store.sessionState?.touchActivity !== 'function') return null;
-    const at = now();
-    const existing = store.sessionState.get(sessionId);
-    let epoch = existing?.epoch ?? 1;
-    if (existing && at - existing.lastActivityAt >= cfg.sessionIdleMs) {
-      const advanced = store.sessionState.advanceEpoch(sessionId, { expect: existing.epoch, at });
-      epoch = advanced?.epoch ?? (store.sessionState.get(sessionId)?.epoch ?? existing.epoch);
-    }
-    store.sessionState.touchActivity(sessionId, { platform: platformOf(sessionId), at });
-    return epoch;
+  function currentEpoch(sessionId) {
+    if (typeof store.sessionState?.get !== 'function') return null;
+    return store.sessionState.get(sessionId)?.epoch ?? null;
   }
 
   /**
@@ -343,11 +340,12 @@ export function createMemoryService({ store, config = {}, platformPolicy } = {})
     },
 
     /**
-     * 会话纪元召回（网关管线的唯一记忆入口），返回多 block + epoch：
+     * 会话纪元召回（网关管线 decorator 步骤 / 桥接 render 的记忆入口），返回
+     * 多 block + epoch：
      *   - identity 块：【画像】+【关系】，按当前对话对象（subjectId）取，
      *     由网关在会话首轮注入一次（epoch 去重），后续轮次不重发；
      *   - long 块：【长期记忆】，subject 相关行优先、其余按分，≤20 条 / 预算内；
-     *   - epoch：resolveEpoch 顺带完成「静默 → 新纪元」判定与活跃触点。
+     *   - epoch：只读当前值（推进在 save 事务，见 session-save.js）。
      *
      * 空边界：无 subject / 无画像关系 → 跳过 identity；无长期行 → 跳过 long；
      * 全空 → blocks: []（epoch 仍返回，网关照常推进轮次，不注入任何段）。
@@ -355,7 +353,7 @@ export function createMemoryService({ store, config = {}, platformPolicy } = {})
      */
     render({ sessionId, subjectId = '', maxChars } = {}) {
       const sid = normalizeSessionId(sessionId);
-      const epoch = resolveEpoch(sid);
+      const epoch = currentEpoch(sid);
       const budget = Math.max(1, Number(maxChars ?? cfg.maxRenderChars));
       const blocks = [];
       let truncated = false;
@@ -378,14 +376,16 @@ export function createMemoryService({ store, config = {}, platformPolicy } = {})
           identityChars += text.length;
           blocks.push({ name: '关系', kind: 'identity', text, chars: text.length });
         }
-        const profile = store.profile?.get?.(sid, subjectId) ?? null;
-        if (profile?.attributes && Object.keys(profile.attributes).length) {
+        // 双层 scope：identity 全局打底 + session 会话覆盖（profile 服务合并读；
+        // 缺服务/无 identity 行时回退单层 store 行，旧口径兼容）。
+        const profileDoc = profile?.get?.(sid, subjectId) ?? store.profile?.get?.(sid, subjectId) ?? null;
+        if (profileDoc?.attributes && Object.keys(profileDoc.attributes).length) {
           const labels = {
             personality: '性格', speakingStyle: '说话风格', catchphrases: '口头禅',
             taboos: '禁忌', relation: '关系定位',
           };
-          const lines = Object.entries(profile.attributes)
-            .filter(([key]) => labels[key] && profile.attributes[key] != null)
+          const lines = Object.entries(profileDoc.attributes)
+            .filter(([key]) => labels[key] && profileDoc.attributes[key] != null)
             .map(([key, value]) => `- ${labels[key]}：${Array.isArray(value) ? value.join('、') : value}`);
           if (lines.length) {
             const text = `【画像】\n${lines.join('\n')}`;

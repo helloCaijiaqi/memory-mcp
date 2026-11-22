@@ -110,7 +110,7 @@ test('render 产出多 block（epoch + identity/long），subject 相关优先�
   service.append({ sessionId: SESSION, tier: 'long', content: '长期：群里的公共约定', subjectId: '' });
   service.append({ sessionId: SESSION, tier: 'short', content: '短期：正在聊语音发送', category: '话题' });
   const out = service.render({ sessionId: SESSION, subjectId: 'u_1' });
-  assert.ok(Number.isInteger(out.epoch) && out.epoch >= 1, 'render 必须返回会话纪元');
+  assert.equal(out.epoch, null, 'render 只读纪元（读路径不再创建/推进；会话状态由 ingest/save 维护）');
   // 短期层已删除：不再渲染短期行。
   const longBlock = out.blocks.find((block) => block.kind === 'long');
   assert.ok(longBlock, '应产出【长期记忆】块');
