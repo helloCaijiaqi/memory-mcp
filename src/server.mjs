@@ -12,6 +12,9 @@ import { createRawService } from './service/raw-service.js';
 import { createFts5Backend, createRecallRouter, createVectorBackend } from './service/recall.js';
 import { createPlatformPolicy } from './service/platform-policy.js';
 import { createSlangService } from './service/slang-service.js';
+import { createMediaService } from './service/media-service.js';
+import { createMediaAnalyzer } from './service/media-analyzer.js';
+import { createMediaRetention } from './service/media-retention.js';
 import { createGatewayAuth, createGatewayV1 } from './service/gateway-v1.js';
 import { createGatewayWatcher } from './gateway-watch.js';
 import { createProfileService } from './service/profile-service.js';
@@ -75,12 +78,24 @@ function resolveLlmConfig(env, warn) {
     }
     merged[fileKey] = envValue ?? fileValue;
   }
+  // vision 子配置（多媒体记忆层，2026-11-24）：主文本模型看不了图，vision 必须
+  // 显式配置独立 model 才启用（enabled+model），baseUrl/apiKey/timeoutMs 继承主
+  // 配置可覆盖。未配置 → media-analyzer 保持 pending（绝不瞎编）。
+  const visionRaw = file.vision && typeof file.vision === 'object' ? file.vision : {};
+  const vision = {
+    enabled: visionRaw.enabled === true || String(env.MEMORY_MCP_LLM_VISION_ENABLED ?? '') === '1',
+    model: env.MEMORY_MCP_LLM_VISION_MODEL ?? String(visionRaw.model ?? '').trim(),
+    ...(env.MEMORY_MCP_LLM_VISION_BASE_URL ? { baseUrl: env.MEMORY_MCP_LLM_VISION_BASE_URL } : (visionRaw.baseUrl ? { baseUrl: String(visionRaw.baseUrl) } : {})),
+    ...(env.MEMORY_MCP_LLM_VISION_API_KEY ? { apiKey: env.MEMORY_MCP_LLM_VISION_API_KEY } : (visionRaw.apiKey ? { apiKey: String(visionRaw.apiKey) } : {})),
+    ...(visionRaw.timeoutMs != null ? { timeoutMs: num(visionRaw.timeoutMs, 45_000) } : {}),
+  };
   return {
     enabled: merged.enabled === true || String(merged.enabled ?? '') === '1',
     baseUrl: merged.baseUrl ?? '',
     apiKey: merged.apiKey ?? '',
     model: merged.model ?? '',
     timeoutMs: num(merged.timeoutMs, 20_000),
+    vision,
     source: hasEnv ? 'env' : (hasFile ? 'file' : 'none'),
   };
 }
@@ -119,6 +134,13 @@ export function resolveConfig(env = process.env) {
     platformStrict: String(env.MEMORY_MCP_PLATFORM_STRICT ?? '') === '1',
     raw: {
       rawRetentionDays: num(env.MEMORY_MCP_RAW_RETENTION_DAYS, 30),
+    },
+    // 媒体缺省清退（媒体管道 v2）：未收藏且超龄的媒体资产删源文件+删记录，
+    // 删行时批量修复摘要/raw 占位符；收藏豁免。缺省每 6 小时扫一轮、30 天超龄。
+    mediaRetention: {
+      enabled: String(env.MEMORY_MCP_MEDIA_RETENTION ?? '1') !== '0',
+      intervalMs: num(env.MEMORY_MCP_MEDIA_RETENTION_HOURS, 6) * HOUR_MS,
+      retentionDays: num(env.MEMORY_MCP_MEDIA_RETENTION_DAYS, 30),
     },
     // LLM（OpenAI 兼容）：黑话解释 + save 摘要共用一个 provider。默认关闭 ——
     // 关闭时 chat_memory_save 跳过摘要/画像/关系步骤（raw + alias + 纪元照常
@@ -178,8 +200,10 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
     profile,
     config: { head: cfg.head, sessionIdleMs: cfg.memory.sessionIdleMs },
     platformPolicy,
-  });
+    mediaRender: (text) => media.renderPlaceholders(text),
+});
   const slang = createSlangService({ store });
+
   const relation = createRelationService({
     store,
     config: { identityEnabled: cfg.relation.identityEnabled, emotionFreshMs: cfg.head.emotionFreshMs },
@@ -187,6 +211,24 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
   });
   const raw = createRawService({ store, stateDir: cfg.stateDir, config: cfg.raw, logger: { log } });
   const llm = createLlmProvider(cfg.llm);
+
+  // 多媒体记忆层（media memory tier）：详情表服务 + 解析兜底队列（2026-11-24）。
+  // mediaDir 固定 state/media（源文件落盘，sha256 命名）；analyzer 是可选 LLM 的
+  // 旁路（vision key 未配置时保持 pending 积压，不影响登记/摘要链路）。
+  const media = createMediaService({
+    store,
+    config: { mediaDir: path.join(cfg.stateDir, 'media'), retiredText: cfg.mediaRetention?.retiredText },
+    // 召回占位符一致性修复回调（媒体管道 v2）：renderPlaceholders 发现源文件缺失时
+    // 由它批量修复摘要/raw（mediaRetention 在下方创建，箭头延迟求值安全）。
+    repairPlaceholder: (id, retiredText) =>
+      mediaRetention.repairPlaceholderBatch(store, [id], retiredText ?? undefined, log),
+  });
+  const mediaAnalyzer = createMediaAnalyzer({ store, service: media, llm, logger: log });
+  mediaAnalyzer.start();
+  // 媒体缺省清退（媒体管道 v2）：未收藏且超龄（缺省 30 天）的资产删源文件+删记录，
+  // 删行时批量修复摘要/raw 占位符；收藏豁免。配置 config.json mediaRetention 块。
+  const mediaRetention = createMediaRetention({ store, media, config: cfg.mediaRetention ?? {}, logger: log });
+  mediaRetention.start();
   // subject 身份层 + session-save 编排（tool.call 统一改造）：网关经 tool.call
   // chat_memory_save 投递整段缓冲，单事务落地 raw/别名/摘要/画像/关系并推进纪元；
   // 内部空闲摘要调度器已删除，落地时机完全由网关裁决。
@@ -210,6 +252,8 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
         },
       },
       llm,
+      media,
+      mediaAnalyzer,
       logger: log,
     })
     : null;
@@ -221,6 +265,8 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
     store,
     backends: [createFts5Backend({ store, config: cfg.recall }), createVectorBackend()],
     config: cfg.recall,
+    // 召回行文本的媒体占位符验证替换（媒体管道 v2）
+    mediaRender: (text) => media.renderPlaceholders(text),
   });
 
   // 网关接入面（热加载）：gateway.json 出现/修复/变更 ≤2s 自动生效，无需重启。
@@ -241,6 +287,9 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
         recall,
         subject,
         sessionSave,
+        media,
+        // chat_media_describe 主动解析需要 analyzer 的 analyzeOne（媒体管道 v3）
+        mediaAnalyzer,
         logger: log,
       });
     } else {
@@ -279,6 +328,9 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
   log(cfg.llm.enabled
     ? `LLM 提取已启用：model=${cfg.llm.model} baseUrl=${cfg.llm.baseUrl}（来源=${cfg.llm.source}）`
     : `LLM 提取未启用（来源=${cfg.llm.source}）——chat_memory_save 只落 raw，长期层退化为 record/手动巩固`);
+  log(cfg.llm.vision?.enabled && cfg.llm.vision?.model
+    ? `LLM 视觉已启用：model=${cfg.llm.vision.model}（多媒体记忆层解析；主模型无视觉能力也不受影响）`
+    : 'LLM 视觉未启用——媒体解析保持 pending（绝不瞎编）');
 
   // 健康检查要能看见「降级到 JSON 兜底」「库是只读」这两件事实，而不是只写进日志。
   const info = {
@@ -290,7 +342,13 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
     archiveDir: path.relative(cfg.stateDir, raw.root) || '.',
     layersV2: cfg.layersV2,
     // LLM 提取 provider 状态（不含 apiKey）：enabled=false 时 save 只落 raw。
-    llm: { enabled: cfg.llm.enabled, model: cfg.llm.model, baseUrl: cfg.llm.baseUrl, source: cfg.llm.source },
+    llm: {
+      enabled: cfg.llm.enabled,
+      model: cfg.llm.model,
+      baseUrl: cfg.llm.baseUrl,
+      source: cfg.llm.source,
+      vision: { enabled: Boolean(cfg.llm.vision?.enabled && cfg.llm.vision?.model), model: cfg.llm.vision?.model ?? null },
+    },
     // 网关接入状态（动态 getter）：热加载后 configured/id 跟着变——排障时第一个
     // 要确认的「到底读没读到 gateway.json、现在生效的是哪份身份」。
     get gateway() {
@@ -320,6 +378,8 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
     ? createHttpApi({
         memory,
         slang,
+        media,
+        mediaAnalyzer,
         relation,
         raw,
         recall,
@@ -366,10 +426,10 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
   process.once('SIGINT', () => { void shutdown('SIGINT'); });
   process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
   if (stdio) {
-    await serveStdio({ memory, slang, relation, raw, recall });
+    await serveStdio({ memory, slang, relation, raw, recall, media, mediaAnalyzer });
     log('stdio MCP 已连接');
   }
-  return { cfg, store, memory, slang, relation, raw, recall, profile, subject, sessionSave, guard, llm, api: httpError ? null : api, token, httpError, info, gatewayWatcher };
+  return { cfg, store, memory, slang, media, mediaAnalyzer, relation, raw, recall, profile, subject, sessionSave, guard, llm, api: httpError ? null : api, token, httpError, info, gatewayWatcher };
 }
 
 const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

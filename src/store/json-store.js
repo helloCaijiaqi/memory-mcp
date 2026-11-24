@@ -13,6 +13,7 @@ import {
   normalizeRawRow,
   normalizeRelationRow,
   normalizeSlangRow,
+  normalizeMediaRow,
   normalizeSnapshotRow,
   relationRowId,
   stableKey,
@@ -52,7 +53,7 @@ export function openJsonStore({ dir, file = 'memory.json' } = {}) {
   fs.mkdirSync(dir, { recursive: true });
   const filePath = path.join(dir, file);
 
-  let data = { version: 2, memory: [], slang: [], raw: [], relation: [], relationHistory: [], snapshot: [], sessionState: [], profile: [], profileHistory: [], relationPending: [] };
+  let data = { version: 2, memory: [], slang: [], media: [], raw: [], relation: [], relationHistory: [], snapshot: [], sessionState: [], profile: [], profileHistory: [], relationPending: [] };
   let readonly = false;
 
   try {
@@ -61,6 +62,7 @@ export function openJsonStore({ dir, file = 'memory.json' } = {}) {
       // 老文件没有这些数组：就地补空，不做版本升级写入（读旧写新即可）。
       if (Array.isArray(parsed?.memory)) data.memory = parsed.memory;
       if (Array.isArray(parsed?.slang)) data.slang = parsed.slang;
+      if (Array.isArray(parsed?.media)) data.media = parsed.media;
       if (Array.isArray(parsed?.raw)) data.raw = parsed.raw;
       if (Array.isArray(parsed?.relation)) data.relation = parsed.relation;
       if (Array.isArray(parsed?.relationHistory)) data.relationHistory = parsed.relationHistory;
@@ -573,6 +575,7 @@ export function openJsonStore({ dir, file = 'memory.json' } = {}) {
     path: filePath,
     memory: makeCollection('memory', (row) => normalizeMemoryRow(row)),
     slang: makeCollection('slang', (row) => normalizeSlangRow(row)),
+    media: makeCollection('media', (row) => normalizeMediaRow(row)),
     raw,
     relation,
     snapshot,

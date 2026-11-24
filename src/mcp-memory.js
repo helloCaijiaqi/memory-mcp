@@ -8,8 +8,9 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 
 const ok = (value) => ({ content: [{ type: 'text', text: JSON.stringify(value ?? null, null, 2) }] });
+const err = (message) => ({ content: [{ type: 'text', text: message }], isError: true });
 
-export function createMcpMemoryServer({ memory, slang, relation, raw, recall }) {
+export function createMcpMemoryServer({ memory, slang, relation, raw, recall, media, mediaAnalyzer }) {
   const server = new McpServer({ name: 'memory-mcp', version: '0.1.0' });
 
   server.tool(
@@ -199,6 +200,67 @@ export function createMcpMemoryServer({ memory, slang, relation, raw, recall }) 
   );
 
   // 关系 / 情绪：单值 + 版本链。只在装配了 relation 服务时注册，避免工具存在但一调就报「未装配」。
+  // 多媒体记忆层（media memory tier）：检索/列表（模型选媒体的依据；发送走网关适配层）。
+  if (media) {
+    server.tool(
+      'media_search',
+      '按含义/关键词检索已识别的多媒体内容（图片/语音等），返回 id 与描述——发送媒体时把 id 交给网关的媒体发送工具。',
+      {
+        text: z.string().describe('关键词（画面描述/标签）'),
+        sessionId: z.string().optional(),
+        kind: z.enum(['image', 'voice', 'video', 'file']).optional(),
+        limit: z.number().int().min(1).max(50).optional(),
+      },
+      async (args) => ok(media.search(args)),
+    );
+    server.tool(
+      'media_list',
+      '列出多媒体资产（默认 ready 且有描述的），可按状态过滤。',
+      {
+        sessionId: z.string().optional(),
+        status: z.enum(['pending', 'ready', 'failed']).optional(),
+        kind: z.enum(['image', 'voice', 'video', 'file']).optional(),
+        limit: z.number().int().min(1).max(50).optional(),
+      },
+      async (args) => ok(media.search(args)),
+    );
+    server.tool(
+      'media_note',
+      '回写媒体认知：对看过的媒体补充描述/标签（mediaId 必须已存在，配合 media_search 使用）。',
+      {
+        mediaId: z.string().describe('占位符 id（ma_ 开头 12 位十六进制）'),
+        desc: z.string().max(300).optional().describe('一句话画面/内容描述'),
+        tags: z.array(z.string().max(24)).max(10).optional().describe('追加的标签'),
+        textContent: z.string().max(2000).optional().describe('媒体中的文字内容（转录）'),
+      },
+      async (args) => {
+        const row = media.updateDesc(args.mediaId, { desc: args.desc, tags: args.tags, textContent: args.textContent });
+        if (!row) return err(`媒体资产不存在：${args.mediaId}`);
+        return ok({ mediaId: row.id, desc: row.desc, tags: row.tags, status: row.status });
+      },
+    );
+    server.tool(
+      'media_describe',
+      '主动解析图片内容：vision 模型看图返回描述并回写详情表（ready 直接返回缓存描述）。收藏语义重设计后无需收藏动作——进入详情表且被解析的媒体即被记住。',
+      {
+        mediaId: z.string().describe('占位符 id（ma_ 开头 12 位十六进制）'),
+      },
+      async (args) => {
+        if (!mediaAnalyzer) return err('解析服务未装配');
+        const asset = media.get(String(args.mediaId ?? ''));
+        if (!asset) return err(`媒体资产不存在：${args.mediaId}`);
+        if (asset.kind !== 'image') return err('当前仅支持图片解析');
+        if (asset.status === 'ready' && (asset.desc || asset.textContent)) {
+          return ok({ mediaId: asset.id, desc: asset.desc || asset.textContent, tags: asset.tags, cached: true });
+        }
+        const r = await mediaAnalyzer.analyzeOne(asset);
+        if (!r?.ok) return err(`暂无法解析（${r?.reason ?? 'vision-failed'}），已转入后台队列重试`);
+        const fresh = media.get(asset.id);
+        return ok({ mediaId: asset.id, desc: fresh?.desc, tags: fresh?.tags });
+      },
+    );
+  }
+
   if (relation) {
     server.tool(
       'relation_set',
@@ -316,8 +378,8 @@ export function createMcpMemoryServer({ memory, slang, relation, raw, recall }) 
   return server;
 }
 
-export async function serveStdio({ memory, slang, relation, raw, recall }) {
-  const server = createMcpMemoryServer({ memory, slang, relation, raw, recall });
+export async function serveStdio({ memory, slang, relation, raw, recall, media }) {
+  const server = createMcpMemoryServer({ memory, slang, relation, raw, recall, media });
   const transport = new StdioServerTransport();
   await server.connect(transport);
   return server;

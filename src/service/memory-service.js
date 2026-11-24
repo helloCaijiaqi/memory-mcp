@@ -7,7 +7,7 @@
 // ingest 只写 raw（原文层），长期层由 record / 手动巩固 / 摘要产生；召回只在会话
 // 创建（新 epoch）时注入一次 identity（画像+关系）与长期记忆，由网关按 epoch 去重。
 import { normalizeSessionId } from '../session-id.js';
-import { MEMORY_KINDS, anchorId, memoryRowId, recordRowId } from '../store/store-api.js';
+import { MEMORY_KINDS, MEDIA_PROBE_RE, anchorId, memoryRowId, recordRowId } from '../store/store-api.js';
 import { DEFAULT_FORGETTING, makeScorer, memoryScore, shouldConsolidate } from './forgetting.js';
 import { DEFAULT_HEAD_CONFIG, buildHead, buildTail, headDecision } from './head-builder.js';
 import { partitionRelations } from './relation-service.js';
@@ -32,8 +32,10 @@ export const DEFAULT_MEMORY_CONFIG = {
  * @param {object} [profile] profile 服务（V2 统一改造：双层 scope 合并读）。
  *   缺省时 render 回退 store.profile 单层行（旧口径，JSON 兜底后端兼容）。
  */
-export function createMemoryService({ store, config = {}, platformPolicy, profile = null } = {}) {
+export function createMemoryService({ store, config = {}, platformPolicy, profile = null, mediaRender = null } = {}) {
   if (!store) throw new Error('createMemoryService 需要 store');
+  // mediaRender（媒体管道 v2）：render/renderTail 输出文本里的媒体占位符验证替换
+  // （server.mjs 注入 media.renderPlaceholders）。未装配则原样返回。
   // 平台白名单只在写入前校验一次：读路径放行（未知平台本来就查不到东西，不该抛错）。
   const checkPlatform = (sessionId) => {
     platformPolicy?.check?.(sessionId);
@@ -107,6 +109,7 @@ export function createMemoryService({ store, config = {}, platformPolicy, profil
    *   长期 = tier='long' 且 kind='episodic'（语义/关系/情绪各有自己的载体，不混在这一层）
    *   关系 = relation 表的当前值（单值，天然没有「取最新一条」的歧义）
    *   黑话 = 已确认词条（全局，不分会话）
+   *   多媒体 = ready 且有描述的媒体资产（一行一资产）
    * 多取一条用于判断是否被截断，截断本身按条数做。
    */
   function collectHeadRows(sessionId, head, at) {
@@ -133,7 +136,13 @@ export function createMemoryService({ store, config = {}, platformPolicy, profil
     const emotionRows = parts.freshEmotions;
 
     const slangRows = store.slang.query({ status: 'confirmed', order: 'stable', limit: head.maxSlang + 1 }).rows;
-    return { longRows, relationRows, emotionRows, slangRows };
+
+    // 多媒体（media memory tier）：ready 且有描述的资产，一行一资产（渲染层再按 id 稳定化）。
+    // store.media 缺席（降级后端旧数据）时安全跳过——head 不因媒体层缺席而失败。
+    const mediaRows = typeof store.media?.query === 'function'
+      ? store.media.query({ status: 'ready', order: 'stable', limit: head.maxMedia + 1 }).rows
+      : [];
+    return { longRows, relationRows, emotionRows, slangRows, mediaRows };
   }
 
   /** 过期情绪不进稳定区，改在尾部以「上次情绪」出现：状态会变，别污染前缀。 */
@@ -408,8 +417,13 @@ export function createMemoryService({ store, config = {}, platformPolicy, profil
       const picked = [];
       let used = 0;
       for (const item of scored.slice(0, 20)) {
+        // 媒体占位符验证替换（媒体管道 v2）：长期记忆行里的占位符换成可读描述/缺省文字
+        const renderContent = (content) => {
+          if (typeof content !== 'string' || !MEDIA_PROBE_RE.test(content)) return content;
+          try { return mediaRender?.(content)?.text ?? content; } catch { return content; }
+        };
         const prefix = item.row.category ? `${item.row.category}：` : '';
-        const line = `- ${prefix}${item.row.content}`;
+        const line = `- ${prefix}${renderContent(item.row.content)}`;
         if (used + line.length + 1 > longBudget) {
           truncated = true; // 只砍尾部，并让调用方如实知道被砍
           break;
@@ -516,8 +530,13 @@ export function createMemoryService({ store, config = {}, platformPolicy, profil
         limit: head.maxShortInTail,
         now: at,
       }).rows;
+      // 短期记忆行也过占位符验证（媒体管道 v2）——tail 是每轮必出的文本。
+      const renderedShortRows = shortRows.map((r) => {
+        if (typeof r.content !== 'string' || !MEDIA_PROBE_RE.test(r.content)) return r;
+        try { return { ...r, content: mediaRender?.(r.content)?.text ?? r.content }; } catch { return r; }
+      });
       const built = buildTail({
-        shortRows,
+        shortRows: renderedShortRows,
         staleEmotions: collectStaleEmotions(sid, head, at),
         recallText: recall,
         body,

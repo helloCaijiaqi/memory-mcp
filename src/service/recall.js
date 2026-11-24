@@ -11,7 +11,7 @@
 // 「三天前聊过、但短期层已经清掉」的话题会凭空消失 —— 所以 fts5 后端同时查原文，
 // 用 msgId 去重（原文在、摘要也在时只保留摘要）。
 import { normalizeSessionId, parseSessionId } from '../session-id.js';
-import { anchorId } from '../store/store-api.js';
+import { anchorId, MEDIA_PROBE_RE } from '../store/store-api.js';
 import { clipText } from './head-builder.js';
 
 export const RECALL_STRATEGIES = ['fts5', 'like', 'scan', 'unavailable', 'none'];
@@ -204,8 +204,10 @@ export function createVectorBackend({ available = () => false, search = () => ({
   };
 }
 
-export function createRecallRouter({ store, backends = [], config = {} } = {}) {
+export function createRecallRouter({ store, backends = [], config = {}, mediaRender = null } = {}) {
   const cfg = { ...DEFAULT_RECALL_CONFIG, ...config };
+  // mediaRender（媒体管道 v2）：行文本里的媒体占位符 → 验证详情表+源文件后替换为
+  // [媒体:id|描述] 或缺省文字（缺失即删记录+修复摘要/raw）。未装配则原样返回。
   const registry = new Map();
   for (const backend of backends) {
     if (backend?.name) registry.set(backend.name, backend);
@@ -280,7 +282,11 @@ export function createRecallRouter({ store, backends = [], config = {} } = {}) {
 
       const total = rows.length;
       const kept = rows.slice(0, maxRows);
-      const lines = kept.map((row) => (row.layer === 'raw' ? `- ［原文］${row.content}` : `- ${row.content}`));
+      const renderContent = (content) => {
+        if (typeof content !== 'string' || !MEDIA_PROBE_RE.test(content)) return content;
+        try { return mediaRender?.(content)?.text ?? content; } catch { return content; }
+      };
+      const lines = kept.map((row) => (row.layer === 'raw' ? `- ［原文］${renderContent(row.content)}` : `- ${renderContent(row.content)}`));
       const clipped = clipText(lines.join('\n'), cfg.maxChars, '…（召回已截断）');
 
       return {
@@ -292,7 +298,7 @@ export function createRecallRouter({ store, backends = [], config = {} } = {}) {
         downgraded: wantsCross && !allowed,
         backend,
         strategy,
-        rows: kept,
+        rows: kept.map((row) => ({ ...row, content: renderContent(row.content) })),
         text: clipped.text,
         chars: clipped.text.length,
         truncated: { rows: total > kept.length, chars: clipped.truncated, messages: kept.length },

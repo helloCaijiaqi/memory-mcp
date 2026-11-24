@@ -81,6 +81,9 @@ async function readRawBody(req) {
 export function createHttpApi({
   memory,
   slang,
+  // 多媒体记忆层（2026-11-24）：mediaService + analyzer（未传 = 端点组缺席）。
+  media,
+  mediaAnalyzer,
   relation,
   raw,
   recall,
@@ -120,6 +123,18 @@ export function createHttpApi({
     ['/api/slang/reject', (args) => slang.reject(args)],
     ['/api/slang/explain', (args) => slang.explain(args)],
     ['/api/slang/remove', (args) => slang.remove(args)],
+
+    // 多媒体记忆层：登记/检索/回写/统计（media 缺席时整组不注册）。
+    ...(media ? [
+      ['/api/media/record', (args) => media.ensureAssets(args)],
+      ['/api/media/sync-cognition', (args) => media.upsertCognition(args)],
+      ['/api/media/get', (args) => media.get(args.id)],
+      ['/api/media/search', (args) => media.search(args)],
+      ['/api/media/update-desc', (args) => media.updateDesc(args.id, args)],
+      ['/api/media/mark-used', (args) => media.markUsed(args.id)],
+      ['/api/media/analyze', () => (mediaAnalyzer ? mediaAnalyzer.analyzeBatch() : { skipped: true })],
+      ['/api/media/stats', () => (mediaAnalyzer ? mediaAnalyzer.stats() : { enabled: false })],
+    ] : []),
     ['/api/blocks/render', (args) => {
       const memoryBlocks = memory.render({ sessionId: args.sessionId, maxChars: args.maxChars }).blocks;
       const slangBlocks = slang.render({ maxChars: args.slangMaxChars, includeCandidates: false }).blocks;

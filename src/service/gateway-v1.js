@@ -116,9 +116,24 @@ function requireText(value, field, max = 256) {
  * @param {object} [deps.recall] recall router（recall）
  * @param {object} [deps.subject] subject 身份层（名字 → subjectId 解析）
  * @param {object} [deps.sessionSave] save 编排（chat_memory_save 唯一落地路径）
+ * @param {object} [deps.media] 多媒体记忆层服务（chat_media_* 工具面）
  * @param {Function} [deps.logger]
  */
-export function createGatewayV1({ auth, memory, recall, subject, sessionSave, logger } = {}) {
+// 媒体指引（媒体管道 v3）：**文案归 memory-mcp 维护**（谁提供工具给 DSH 用，预设归谁
+// 管）——经 chat_memory_get prefix 每轮动态下发，格式变更免同步静态 preset。
+const MEDIA_GUIDANCE_SECTION = {
+  name: '媒体指引',
+  text: [
+    '【媒体占位符语义】消息与记忆文本里的 [图片|ma_xxx] / [语音|…] / [视频|…] / [文件|…] / [表情|…] 是媒体内容占位符（ma_xxx 是媒体资产 id）：',
+    '- 它只代表一张图/一段语音等媒体内容，不是消息 id——绝不要把它当 replyToMessageId 等消息标识使用；',
+    '- 想看图的内容：调用 chat_media_describe（会解析图片返回描述）；想发表情/图片：先用 chat_media_search 拿候选列表（按语义匹配×使用热度随机采样，从中挑一个），再用 chat_media_send 发送；',
+    '- 媒体是否被记住是自动的：被记忆服务解析过的媒体会长期保留并优先注入，无需收藏动作。',
+  ].join('\n'),
+  priority: 40,
+};
+
+export function createGatewayV1({
+  mediaAnalyzer = null, auth, memory, recall, subject, sessionSave, media, logger } = {}) {
   const log = logger ?? (() => {});
 
   // ── 工具面：chat_memory_* → 内部 service 方法（与 /api/* 同一实现，不复制业务）──
@@ -147,6 +162,8 @@ export function createGatewayV1({ auth, memory, recall, subject, sessionSave, lo
             text: block.text,
             priority: block.kind === 'identity' ? 90 : 50,
           }));
+        // 媒体指引块（谁提供工具谁管预设）：media 已装配即注入，随记忆尾部下发
+        if (media) sections.push({ ...MEDIA_GUIDANCE_SECTION });
         return { sections, epoch: rendered?.epoch ?? null };
       } catch (error) {
         // 宁放行不误杀：装饰失败等价于「本轮没有记忆段」，网关管线同样 fail-safe。
@@ -164,6 +181,95 @@ export function createGatewayV1({ auth, memory, recall, subject, sessionSave, lo
       const messages = Array.isArray(args?.messages) ? args.messages : [];
       if (messages.length === 0) throw new Error('chat_memory_save 需要 messages 数组（整段缓冲）');
       return sessionSave.save({ sessionKey, messages, partial: args?.partial === true });
+    },
+    // ── 多媒体记忆层（media memory tier，2026-11-24）───────────────────────
+    // 检索/直查/使用统计。媒体发送本体在网关侧（chat_media_send 内置 executor：
+    // 这里只提供认知面查询——模型先 search/get 选媒体，网关再按平台格式发送）。
+    chat_media_search: async (args) => {
+      if (!media) throw new Error('媒体服务未装配（检查 server.mjs）');
+      const text = String(args?.query ?? args?.text ?? '').trim().slice(0, 120);
+      const kind = ['image', 'voice', 'video', 'file'].includes(args?.kind) ? args.kind : undefined;
+      const limit = Number.isSafeInteger(args?.limit) ? Math.min(50, Math.max(1, args.limit)) : 5;
+      // 收藏池：只取 ready 且有描述的资产（= 已收藏；pending/failed 不能作为发送
+      // 依据，模型会拿到裸 id）。多拉 50 条相关候选，交给选图器做「语义×热度×
+      // 随机」定量采样——表情包选择要有随机感，但好图稳定排前。
+      const { rows } = media.search({ text, kind, limit: 50 });
+      const pool = rows.filter((r) => r.status === 'ready' && (r.desc || r.textContent)).map((r) => ({
+        mediaId: r.id, kind: r.kind, desc: r.desc || r.textContent, tags: r.tags,
+        useCount: r.useCount ?? 0,
+        ...(r.ref ? { ref: r.ref } : {}),
+      }));
+      const items = media.selectForSend(pool, { query: text, limit });
+      return {
+        media: items,
+        ...(text ? {} : { note: '未给 query：按使用热度+随机返回收藏的媒体' }),
+      };
+    },
+    chat_media_get: async (args) => {
+      if (!media) throw new Error('媒体服务未装配（检查 server.mjs）');
+      const id = String(args?.mediaId ?? '').trim();
+      if (!/^ma_[0-9a-f]{12}$/.test(id)) throw new Error('mediaId 必须是 ma_ 开头的 12 位十六进制占位符 id');
+      const asset = media.get(id);
+      if (!asset) return { found: false };
+      return { found: true, media: { mediaId: asset.id, kind: asset.kind, desc: asset.desc || asset.textContent, tags: asset.tags, ref: asset.ref, sendHints: asset.sendHints, status: asset.status } };
+    },
+    chat_media_mark_used: async (args) => {
+      if (!media) throw new Error('媒体服务未装配（检查 server.mjs）');
+      const id = String(args?.mediaId ?? '').trim();
+      if (!id) throw new Error('mediaId is required');
+      const row = media.markUsed(id);
+      return { ok: Boolean(row), useCount: row?.useCount ?? null };
+    },
+    // 实时登记（媒体管道 v2）：网关收到含占位符的消息时 fire-and-forget 调用，
+    // 把信封指导清单（hashId→fileRef/url）交给记忆层——id 幂等 + 三源落盘，
+    // 让当轮 chat_media_search/get 就能查到（不必等 save 批次）。
+    chat_media_record: async (args) => {
+      if (!media) throw new Error('媒体服务未装配（检查 server.mjs）');
+      const sessionId = String(args?.sessionId ?? '').trim();
+      const list = Array.isArray(args?.media) ? args.media : [];
+      const rows = await media.ensureAssets({ sessionId, media: list });
+      return { ok: true, recorded: rows.length };
+    },
+    // 认知回写（媒体管道 v2）：DSH 看图/理解媒体后回写描述与标签（内部转发到
+    // updateDesc——desc/tags/textContent 合并写、status 自动 ready）。
+    chat_media_note: async (args) => {
+      if (!media) throw new Error('媒体服务未装配（检查 server.mjs）');
+      const id = String(args?.mediaId ?? '').trim();
+      if (!id) throw new Error('mediaId is required');
+      const row = media.updateDesc(id, { desc: args.desc, tags: args.tags, textContent: args.textContent });
+      if (!row) throw new Error(`媒体资产不存在：${id}`);
+      return { ok: true, mediaId: row.id, desc: row.desc, tags: row.tags, status: row.status };
+    },
+    // 主动解析（媒体管道 v3）：DSH 当轮想看图时经此触发 vision 解析——
+    // ready 直接返回已有描述；pending 同步解析（超时降级后台队列，绝不标 failed）；
+    // 收藏语义重设计后「进入详情表且被解析 = 收藏」，无收藏动作工具。
+    chat_media_describe: async (args) => {
+      if (!media || !mediaAnalyzer) throw new Error('媒体服务未装配（检查 server.mjs）');
+      const id = String(args?.mediaId ?? '').trim();
+      if (!/^ma_[0-9a-f]{12}$/.test(id)) throw new Error('mediaId 必须是 ma_ 开头的 12 位十六进制占位符 id');
+      const asset = media.get(id);
+      if (!asset) throw new Error(`媒体资产不存在：${id}`);
+      if (asset.kind !== 'image') {
+        return { ok: false, reason: 'kind-not-image', mediaId: id, kind: asset.kind, note: '当前仅支持图片解析' };
+      }
+      if (asset.status === 'ready' && (asset.desc || asset.textContent)) {
+        return { ok: true, mediaId: id, desc: asset.desc || asset.textContent, tags: asset.tags, cached: true };
+      }
+      // 同步解析 + 超时降级（Promise.race）：超时后 analyzeOne 继续跑完写库，
+      // 模型拿到「已转入后台队列重试」——保持 pending，绝不标 failed。
+      const timeoutMs = Number.isSafeInteger(args?.timeoutMs) ? Math.min(60000, Math.max(5000, args.timeoutMs)) : 30000;
+      let raced = false;
+      const job = mediaAnalyzer.analyzeOne(asset).finally(() => { raced = true; });
+      const timer = new Promise((resolve) => setTimeout(() => resolve('timeout'), timeoutMs));
+      const result = await Promise.race([job, timer]);
+      if (result === 'timeout') {
+        return { ok: false, reason: 'timeout', mediaId: id, note: '解析耗时较长，已转入后台队列继续，稍后可用 chat_media_get 查询' };
+      }
+      if (result?.ok) {
+        const fresh = media.get(id);
+        return { ok: true, mediaId: id, desc: fresh?.desc, tags: fresh?.tags };
+      }
+      return { ok: false, reason: result?.reason ?? 'vision-failed', mediaId: id, note: '暂无法解析（视觉模型不可用或内容取不到），已转入后台队列重试' };
     },
     chat_memory_recall: (args, ctx) => {
       if (!recall) throw new Error('recall 服务未装配（检查 server.mjs）');
@@ -245,6 +351,12 @@ export function createGatewayV1({ auth, memory, recall, subject, sessionSave, lo
     { name: 'chat_memory_recall', role: 'tool', description: '按查询意图检索长期记忆条目（话题/偏好/关系召回）', inputSchema: { type: 'object' } },
     { name: 'chat_memory_record', role: 'tool', description: '写入单条长期记忆（显式「记住某件事」路径）', inputSchema: { type: 'object' } },
     { name: 'chat_memory_forget', role: 'tool', description: '删除指定的长期记忆条目', inputSchema: { type: 'object' } },
+    { name: 'chat_media_search', role: 'tool', description: '从收藏的媒体（已识别的图片/表情等）按含义检索，返回定量候选列表（语义匹配度×使用热度×随机采样，mediaId+描述+热度）——发送前先用本工具选图，配合网关媒体发送工具使用', inputSchema: { type: 'object' } },
+    { name: 'chat_media_get', role: 'tool', description: '按 mediaId 查询多媒体资产详情（描述/标签/发送凭据）', inputSchema: { type: 'object' } },
+    { name: 'chat_media_mark_used', role: 'tool', description: '标记某媒体资产被使用（发送后回写学习信号）', inputSchema: { type: 'object' } },
+    { name: 'chat_media_record', role: 'tool', description: '登记多媒体资产（网关实时旁路：hashId→fileRef/url 指导清单，幂等）', inputSchema: { type: 'object' } },
+    { name: 'chat_media_note', role: 'tool', description: '回写媒体认知：对看过的媒体补充描述/标签（mediaId 必须已存在）', inputSchema: { type: 'object' } },
+    { name: 'chat_media_describe', role: 'tool', description: '主动解析图片内容：vision 模型看图返回描述并回写详情表（ready 直接返回缓存描述；超时降级后台队列）', inputSchema: { type: 'object' } },
   ];
 
   const endpoints = new Map([

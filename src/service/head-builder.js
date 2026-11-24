@@ -14,6 +14,7 @@ export const DEFAULT_HEAD_CONFIG = {
   maxLong: 20, // 长期记忆条数上限（不按字符切：字符切会让一条记忆被劈成半句）
   maxRelation: 20,
   maxSlang: 20,
+  maxMedia: 8,
   maxEmotionInTail: 3,
   maxShortInTail: 8,
   quietWindowMs: 30 * 60 * 1000, // 静默这么久才认为是一段对话的自然断点
@@ -121,6 +122,11 @@ function slangLine(row) {
   return row.meaning ? `- ${row.content}：${row.meaning}` : `- ${row.content}`;
 }
 
+function mediaLine(row) {
+  const kindLabel = { image: '图', voice: '语音', video: '视频', file: '文件' }[row.kind] ?? '媒体';
+  return `- [${kindLabel}] ${row.text}`;
+}
+
 /**
  * 渲染稳定区。纯函数：同样的输入必然产出同样的字节。
  *
@@ -129,12 +135,14 @@ function slangLine(row) {
  *   关系：按 subject → key → scope → id 升序取前 maxRelation 条
  *   情绪：仅保留 emotionFreshMs 内的，按 subject → id 升序取前 maxRelation 条
  *   黑话：按 content → id 升序取前 maxSlang 条
+ *   多媒体：按 id 升序取前 maxMedia 条（use_count 排序在取数层完成）
  */
 export function buildHead({
   longRows = [],
   relationRows = [],
   emotionRows = [],
   slangRows = [],
+  mediaRows = [],
   config = {},
 } = {}) {
   const cfg = { ...DEFAULT_HEAD_CONFIG, ...config };
@@ -156,11 +164,15 @@ export function buildHead({
     .slice(0, Math.max(0, cfg.maxRelation));
   const slang = [...slangRows].sort((a, b) => cmpStr(a.content, b.content) || cmpStr(a.id, b.id)).slice(0, Math.max(0, cfg.maxSlang));
 
+  // 多媒体：use_count 已在取数层排序，这里只做稳定化（id 序），渲染一行一资产。
+  const media = [...mediaRows].sort((a, b) => cmpStr(a.id, b.id)).slice(0, Math.max(0, cfg.maxMedia));
+
   const sections = [];
   if (long.length) sections.push(['【长期记忆】', ...long.map(longLine)]);
   if (relations.length) sections.push(['【关系】', ...relations.map((row) => relationLine(row, cfg))]);
   if (emotions.length) sections.push(['【情绪】', ...emotions.map((row) => emotionLine(row, cfg))]);
   if (slang.length) sections.push(['【黑话】', ...slang.map(slangLine)]);
+  if (media.length) sections.push(['【多媒体】', ...media.map(mediaLine)]);
 
   const raw = sections.map((lines) => lines.join('\n')).join('\n');
   const clipped = clipText(raw, cfg.maxHeadChars, '…（头部已截断）');
@@ -174,6 +186,7 @@ export function buildHead({
       relation: relationRows.length > cfg.maxRelation,
       emotion: emotionRows.length > cfg.maxRelation,
       slang: slangRows.length > cfg.maxSlang,
+      media: mediaRows.length > cfg.maxMedia,
     },
   };
 }

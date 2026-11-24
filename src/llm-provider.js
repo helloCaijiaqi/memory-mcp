@@ -10,14 +10,40 @@ export const DEFAULT_LLM_CONFIG = {
   apiKey: '',
   model: '',
   timeoutMs: 15000,
+  // vision 子配置（多媒体记忆层，2026-11-24 拆分）：独立于主 model——主文本模型
+  // 看不了图，vision() 复用主 model 会拿到瞎编的描述污染媒体记忆。规则：
+  //   vision.enabled && vision.model 必须显式给出才启用视觉；
+  //   baseUrl/apiKey 缺省继承主配置（vision 块可覆盖，支持换云端 API）。
+  // 未配置 → vision() 返回 null → media-analyzer 保持 pending（绝不瞎编）。
+  vision: null,
 };
 
 export function createLlmProvider(config = {}) {
   const cfg = { ...DEFAULT_LLM_CONFIG, ...config };
   const usable = Boolean(cfg.enabled && cfg.baseUrl && cfg.apiKey && cfg.model);
+  // vision 请求参数：model 必须显式声明；baseUrl/apiKey/timeoutMs 继承主配置可覆盖。
+  const visionCfg = cfg.vision && typeof cfg.vision === 'object'
+    ? {
+        baseUrl: String(cfg.vision.baseUrl ?? cfg.baseUrl ?? ''),
+        apiKey: String(cfg.vision.apiKey ?? cfg.apiKey ?? ''),
+        model: String(cfg.vision.model ?? '').trim(),
+        timeoutMs: Number(cfg.vision.timeoutMs ?? cfg.timeoutMs ?? 20000),
+      }
+    : null;
+  const visionUsable = Boolean(
+    cfg.enabled
+    && visionCfg
+    && cfg.vision?.enabled === true
+    && visionCfg.baseUrl
+    && visionCfg.apiKey
+    && visionCfg.model,
+  );
   return {
     get enabled() {
       return usable;
+    },
+    get visionEnabled() {
+      return visionUsable;
     },
     config: cfg,
     /**
@@ -42,6 +68,49 @@ export function createLlmProvider(config = {}) {
             temperature,
             max_tokens: maxTokens,
             ...(json ? { response_format: { type: 'json_object' } } : {}),
+          }),
+          signal: controller.signal,
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        const text = String(data?.choices?.[0]?.message?.content ?? '').trim();
+        return text || null;
+      } catch {
+        return null;
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    /**
+     * 视觉解析（多媒体记忆层）：图片 base64 → 描述文本。OpenAI 兼容协议的
+     * image_url content 格式；不支持视觉的服务端会报错，返回 null（调用方降级
+     * pending，不影响主链路——与 complete 同纪律）。
+     */
+    async vision({ system, prompt, imageBase64, mime = 'image/png', maxTokens = 300 } = {}) {
+      if (!visionUsable || !imageBase64) return null;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), Math.max(1000, visionCfg.timeoutMs));
+      try {
+        const res = await fetch(`${visionCfg.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${visionCfg.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: visionCfg.model,
+            messages: [
+              ...(system ? [{ role: 'system', content: system }] : []),
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: String(prompt ?? '描述这张图片') },
+                  { type: 'image_url', image_url: { url: `data:${mime};base64,${imageBase64}` } },
+                ],
+              },
+            ],
+            temperature: 0.2,
+            max_tokens: maxTokens,
           }),
           signal: controller.signal,
         });

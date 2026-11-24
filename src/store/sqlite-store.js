@@ -9,6 +9,7 @@ import { StoreMigrationError, StoreReadOnlyError, StoreUnavailableError } from '
 import { MIGRATIONS, SCHEMA } from './sqlite-schema.js';
 import { createMemoryCollection } from './sqlite-memory.js';
 import { createSlangCollection } from './sqlite-slang.js';
+import { createMediaCollection } from './sqlite-media.js';
 import { createRawCollection } from './sqlite-raw.js';
 import { createRelationCollection } from './sqlite-relation.js';
 import { createSnapshotCollection } from './sqlite-snapshot.js';
@@ -170,6 +171,7 @@ export function openSqliteStore({ dir, file = 'memory.db', logger = console, rea
 
   const memory = createMemoryCollection({ db, usable, writable, prepare });
   const slang = createSlangCollection({ db, usable, writable, prepare });
+  const media = createMediaCollection({ db, usable, writable, prepare });
   const raw = createRawCollection({ db, usable, writable, prepare });
   const relation = createRelationCollection({ db, usable, writable, prepare });
   const snapshot = createSnapshotCollection({ db, usable, writable, prepare });
@@ -223,6 +225,7 @@ export function openSqliteStore({ dir, file = 'memory.db', logger = console, rea
     path: dbPath,
     memory,
     slang,
+    media,
     raw,
     relation,
     snapshot,
@@ -280,6 +283,7 @@ export function openSqliteStore({ dir, file = 'memory.db', logger = console, rea
       return {
         memory: safe(() => memory.count()),
         slang: safe(() => slang.count()),
+        media: safe(() => media.count()),
         raw: safe(() => raw.count()),
         relation: safe(() => relation.count()),
         snapshot: safe(() => snapshot.count()),

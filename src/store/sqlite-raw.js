@@ -134,6 +134,50 @@ export function createRawCollection({ db, usable, writable, prepare }) {
     return { rows: db.prepare(sql).all(...params, limit).map(rawFromRow), strategy: text ? 'like' : 'scan' };
   }
 
+  /**
+   * 占位符一致性修复（媒体管道 v2，2026-11-24）：批量把 raw_message.text 里的媒体
+   * 占位符替换为缺省文字（源文件清退/缺失场景）。**打破「raw 只追加」纪律**——
+   * 用户明确要求按 hashId 修复 raw 保持数据状态一致；只替换占位符子串，其余字节不动，
+   * FTS 同步重建。pairs: [[占位符文本, 替换文字], ...]（一次调用一批，避免逐资产全表扫）。
+   */
+  function replacePlaceholderText({ pairs = [], limit = 500 } = {}) {
+    writable();
+    const clean = pairs
+      .map(([placeholder, replacement]) => [String(placeholder ?? ''), String(replacement ?? '')])
+      .filter(([ph]) => ph);
+    if (!clean.length) return { scanned: 0, updated: 0, ids: [] };
+    // v3 双模式：pairs 第一元素是资产 id（ma_<12hex>）→ id 模式（LIKE 按 id 文本
+    // 特征找行，行内正则匹配「含该 id 的占位符任意形态」——类型词不定/可能带描述段——
+    // 整体替换）；否则字面模式（完整占位符文本直配，split/join）。
+    // LIKE 直拼不转义：占位符与 id 均无 %_/ 特殊字符，且本 LIKE 不带 ESCAPE 子句
+    // （ESCAPE '\' 在 SQLite 文本里引号无法闭合；likePattern 把 _ 转义成 \_ 导致
+    // 失配——踩过的坑，2026-11-24）。
+    const likeConds = clean.map(() => "text LIKE ?").join(' OR ');
+    const candidates = db
+      .prepare(`SELECT id, text FROM raw_message WHERE ${likeConds} LIMIT ?`)
+      .all(...clean.map(([ph]) => `%${ph}%`), clampInt(limit, 1, 5000, 500));
+    let updated = 0;
+    const changedIds = [];
+    for (const row of candidates) {
+      let next = row.text;
+      for (const [ph, replacement] of clean) {
+        if (/^ma_[0-9a-f]{12}$/.test(ph)) {
+          // id 已过 MEDIA_ID_RE 校验（ma_+纯 hex）——拼进正则无注入面
+          const phRe = new RegExp(`\\[(?:图片|语音|视频|文件|表情|媒体)\\|${ph}(?:\\|[^\\]]*)?\\]`, 'g');
+          next = next.replace(phRe, replacement);
+        } else if (next.includes(ph)) {
+          next = next.split(ph).join(replacement);
+        }
+      }
+      if (next === row.text) continue;
+      prepare('rawPhUpd', 'UPDATE raw_message SET text = ? WHERE id = ?').run(next, row.id);
+      refreshFts({ id: row.id, text: next });
+      updated += 1;
+      changedIds.push(row.id);
+    }
+    return { scanned: candidates.length, updated, ids: changedIds };
+  }
+
   /** 标记归档并清空正文（元数据与锚点保留，回溯用）。 */
   function archive({ ids = [], at = Date.now() } = {}) {
     writable();
@@ -203,5 +247,5 @@ export function createRawCollection({ db, usable, writable, prepare }) {
     return Number(db.prepare(sql).get(...params)?.n ?? 0);
   }
 
-  return { get, getByMsgId, append, query, archive, purge, count };
+  return { get, getByMsgId, append, query, replacePlaceholderText, archive, purge, count };
 }

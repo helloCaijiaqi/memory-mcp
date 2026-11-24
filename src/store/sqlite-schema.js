@@ -8,7 +8,7 @@
 // 为什么不用 SCHEMA 改表：SCHEMA 靠 IF NOT EXISTS 执行，对「表已存在但缺列」完全无效，
 // 老库会静默缺列（写入报错或字段丢失），这类问题在生产上极难定位。
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 5;
 
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS memory (
@@ -127,6 +127,40 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_subject_alias_unique
   ON subject_alias(platform, alias, scope, subject_id);
 CREATE INDEX IF NOT EXISTS idx_subject_alias_lookup
   ON subject_alias(platform, alias, scope);
+
+-- 多媒体记忆层（media memory tier，v4）：多媒体内容的详情表，占位符 id 主键。
+-- gateway 在观察消息时为媒体项生成确定性占位符 id（ma_<sha1 前 12 位>）并嵌入
+-- 消息文本；session-save 落 raw 时检测占位符 + 随行 media 元数据 → 按 id 在此
+-- 自动新建详情记录（status=pending）；LLM 解析（网关/DSH 回写或 media-analyzer
+-- 兜底队列）完成后回写 desc/tags 并置 ready。kind 统一大范围概念（image 涵盖
+-- 表情包，无独立 sticker），ref 存平台发送凭据（QQ 收藏 resId / 语音库相对路径 /
+-- 源 URL），send_hints 存各平台发送方式提示（跨平台发送适配层读取）。
+CREATE TABLE IF NOT EXISTS media_asset (
+  id           TEXT PRIMARY KEY,
+  session_id   TEXT NOT NULL,
+  platform     TEXT NOT NULL,
+  kind         TEXT NOT NULL DEFAULT 'image',
+  source_path  TEXT NOT NULL DEFAULT '',
+  hash         TEXT NOT NULL DEFAULT '',
+  origin       TEXT NOT NULL DEFAULT 'inbound',
+  ref          TEXT NOT NULL DEFAULT '',
+  send_hints   TEXT NOT NULL DEFAULT '{}',
+  desc         TEXT NOT NULL DEFAULT '',
+  tags         TEXT NOT NULL DEFAULT '[]',
+  text_content TEXT NOT NULL DEFAULT '',
+  duration_ms  INTEGER,
+  status       TEXT NOT NULL DEFAULT 'pending',
+  use_count    INTEGER NOT NULL DEFAULT 0,
+  last_used_at INTEGER,
+  favorited    INTEGER NOT NULL DEFAULT 0,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_media_fav     ON media_asset(favorited, updated_at);
+CREATE INDEX IF NOT EXISTS idx_media_status  ON media_asset(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_media_session ON media_asset(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_media_hash    ON media_asset(hash) WHERE hash != '';
+CREATE VIRTUAL TABLE IF NOT EXISTS media_fts USING fts5(desc, tags, id UNINDEXED, tokenize = 'trigram');
 `;
 
 // platform 一律由 session_id 派生，CHECK 只做兜底：两处不一致说明上层绕过了 normalizeSessionId。
@@ -299,6 +333,47 @@ export const MIGRATIONS = [
       //     （会话覆盖）。存量行默认 'session' —— 计划口径「存量 (session_id,
       //     subject_id) 迁移为 session scope」由默认值直接满足，无需数据搬运。 ---
       `ALTER TABLE profile ADD COLUMN scope TEXT NOT NULL DEFAULT 'session'`,
+    ],
+  },
+  {
+    version: 4,
+    statements: [
+      // --- 多媒体记忆层：media_asset 详情表（占位符 id 主键）+ fts 索引 ---
+      //     新库由 SCHEMA 直接建表；本段对 v3 旧库补齐（IF NOT EXISTS 幂等）。
+      `CREATE TABLE IF NOT EXISTS media_asset (
+         id           TEXT PRIMARY KEY,
+         session_id   TEXT NOT NULL,
+         platform     TEXT NOT NULL,
+         kind         TEXT NOT NULL DEFAULT 'image',
+         source_path  TEXT NOT NULL DEFAULT '',
+         hash         TEXT NOT NULL DEFAULT '',
+         origin       TEXT NOT NULL DEFAULT 'inbound',
+         ref          TEXT NOT NULL DEFAULT '',
+         send_hints   TEXT NOT NULL DEFAULT '{}',
+         desc         TEXT NOT NULL DEFAULT '',
+         tags         TEXT NOT NULL DEFAULT '[]',
+         text_content TEXT NOT NULL DEFAULT '',
+         duration_ms  INTEGER,
+         status       TEXT NOT NULL DEFAULT 'pending',
+         use_count    INTEGER NOT NULL DEFAULT 0,
+         last_used_at INTEGER,
+         created_at   INTEGER NOT NULL,
+         updated_at   INTEGER NOT NULL
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_media_status  ON media_asset(status, created_at)`,
+      `CREATE INDEX IF NOT EXISTS idx_media_session ON media_asset(session_id, created_at)`,
+      `CREATE INDEX IF NOT EXISTS idx_media_hash    ON media_asset(hash) WHERE hash != ''`,
+      `CREATE VIRTUAL TABLE IF NOT EXISTS media_fts USING fts5(desc, tags, id UNINDEXED, tokenize = 'trigram')`,
+    ],
+  },
+  {
+    version: 5,
+    statements: [
+      // --- 媒体收藏（媒体管道 v2，2026-11-24）：favorited 标识符——收藏的资产
+      //     豁免缺省清退（永久保留），【多媒体】注入优先展示。QQ 收藏（collect）
+      //     已退役，收藏判断归 DSH，经 chat_media_favorite 标记（前置存在检查）。
+      `ALTER TABLE media_asset ADD COLUMN favorited INTEGER NOT NULL DEFAULT 0`,
+      `CREATE INDEX IF NOT EXISTS idx_media_fav ON media_asset(favorited, updated_at)`,
     ],
   },
 ];
@@ -490,6 +565,47 @@ export function slangFromRow(row) {
     evidence,
     score: row.score,
     hits: row.hits,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function parseTags(value) {
+  try {
+    const parsed = JSON.parse(value || '[]');
+    return Array.isArray(parsed) ? parsed.map((item) => String(item)).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function mediaFromRow(row) {
+  if (!row) return null;
+  let sendHints = {};
+  try {
+    const parsed = JSON.parse(row.send_hints || '{}');
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) sendHints = parsed;
+  } catch {
+    sendHints = {};
+  }
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    platform: row.platform,
+    kind: row.kind,
+    sourcePath: row.source_path ?? '',
+    hash: row.hash ?? '',
+    origin: row.origin,
+    ref: row.ref ?? '',
+    sendHints,
+    desc: row.desc ?? '',
+    tags: parseTags(row.tags),
+    textContent: row.text_content ?? '',
+    durationMs: row.duration_ms ?? null,
+    status: row.status,
+    useCount: row.use_count ?? 0,
+    lastUsedAt: row.last_used_at ?? null,
+    favorited: row.favorited === 1,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

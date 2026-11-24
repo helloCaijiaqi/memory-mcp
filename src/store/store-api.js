@@ -23,6 +23,20 @@ export const MEMORY_STATUS = ['active', 'archived'];
 export const SLANG_STATUS = ['candidate', 'confirmed', 'rejected'];
 export const QUERY_STRATEGIES = ['fts5', 'like', 'scan'];
 
+// 多媒体记忆层（media memory tier）：统一大范围 kind（image 涵盖表情包，无独立 sticker）。
+export const MEDIA_KINDS = ['image', 'voice', 'video', 'file'];
+export const MEDIA_STATUS = ['pending', 'ready', 'failed'];
+export const MEDIA_ORIGINS = ['inbound', 'collect', 'voice_lib', 'manual'];
+// 占位符格式与 id 校验（媒体管道 v3）：bridge 生成 `ma_<sha1 前 12 位>`，
+// 消息文本内嵌唯一格式 `[图片|<id>]`（可选第三段容忍描述形态，提取只取 id）；
+// 「媒体」是迁移兜底词。不做双格式兼容——历史 [media:<id>] 已由
+// scripts/migrate-placeholder-v3.mjs 全量改写。与 bridge media-placeholder /
+// gateway memory-ingest 三处同源。
+export const MEDIA_ID_RE = /^ma_[0-9a-f]{12}$/;
+export const MEDIA_PLACEHOLDER_RE = /\[(图片|语音|视频|文件|表情|媒体)\|(ma_[0-9a-f]{12})(?:\|[^\]]*)?\]/g;
+/** 占位符快速探测（无 g 无 lastIndex 隐患）——渲染链热路径用。 */
+export const MEDIA_PROBE_RE = /\[(?:图片|语音|视频|文件|表情|媒体)\|ma_[0-9a-f]{12}/;
+
 export class StoreUnavailableError extends Error {
   constructor(message, cause) {
     super(message);
@@ -164,6 +178,46 @@ export function normalizeSlangRow(row, { now = nowMs() } = {}) {
     hits: clampInt(row.hits, 0, 1e9, 0),
     createdAt: clampInt(row.createdAt, 0, Number.MAX_SAFE_INTEGER, now),
     updatedAt: now,
+  };
+}
+
+/** 媒体资产行规范化（多媒体记忆层详情表）。占位符 id 由 gateway 生成，服务侧不重发新 id。 */
+export function normalizeMediaRow(row, { now = nowMs() } = {}) {
+  if (!row || typeof row !== 'object') throw new TypeError('媒体资产行必须是对象');
+  const id = String(row.id ?? '').trim();
+  if (!MEDIA_ID_RE.test(id)) throw new TypeError(`媒体资产 id 必须是占位符 id（ma_xxxxxxxxxxxx），收到：${id}`);
+  const sessionId = normalizeSessionId(row.sessionId);
+  const kind = MEDIA_KINDS.includes(row.kind) ? row.kind : 'image';
+  const status = MEDIA_STATUS.includes(row.status) ? row.status : 'pending';
+  const origin = MEDIA_ORIGINS.includes(row.origin) ? row.origin : 'inbound';
+  const tags = Array.isArray(row.tags)
+    ? row.tags.map((item) => String(item).trim()).filter(Boolean).slice(0, 20)
+    : [];
+  const sendHints = row.sendHints && typeof row.sendHints === 'object' && !Array.isArray(row.sendHints)
+    ? row.sendHints
+    : {};
+  const durationRaw = row.durationMs == null ? null : Number(row.durationMs);
+  return {
+    id,
+    sessionId,
+    platform: parseSessionId(sessionId).platform,
+    kind,
+    sourcePath: String(row.sourcePath ?? '').trim(),
+    hash: String(row.hash ?? '').trim(),
+    origin,
+    ref: String(row.ref ?? '').trim(),
+    sendHints,
+    desc: String(row.desc ?? '').trim(),
+    tags,
+    textContent: String(row.textContent ?? '').trim(),
+    durationMs: durationRaw != null && Number.isFinite(durationRaw) ? Math.max(0, Math.round(durationRaw)) : null,
+    status,
+    useCount: clampInt(row.useCount, 0, 1e9, 0),
+    // favorited 字段退役（媒体管道 v3 收藏语义重设计）：列保留弃用，不再读映射
+    lastUsedAt: row.lastUsedAt != null ? clampInt(row.lastUsedAt, 0, Number.MAX_SAFE_INTEGER, now) : null,
+    createdAt: clampInt(row.createdAt, 0, Number.MAX_SAFE_INTEGER, now),
+    // updatedAt 可覆盖（媒体管道 v2）：清退/修复场景按内容回写时间戳；常规登记不传即 now。
+    updatedAt: row.updatedAt != null ? clampInt(row.updatedAt, 0, Number.MAX_SAFE_INTEGER, now) : now,
   };
 }
 

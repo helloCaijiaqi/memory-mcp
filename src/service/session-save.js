@@ -68,6 +68,9 @@ export function createSessionSave({
   /** relation 写入钩子（relation-guard 批次注入：带守卫的抽取落库）。 */
   guard = null,
   llm = null,
+  /** 多媒体记忆层：mediaService（占位符检测/重写）+ mediaAnalyzer（快解析兜底）。 */
+  media = null,
+  mediaAnalyzer = null,
   config = {},
   logger = () => {},
   now = Date.now,
@@ -159,7 +162,9 @@ export function createSessionSave({
           pendingWindows.shift();
           continue;
         }
-        const prompt = buildPrompt({ sessionId: win.sessionId, messages: records2 });
+        // 补写窗口的占位符同样重写为解释文字（期间后台队列可能已补全详情）。
+        const rewritten2 = media ? records2.map((item) => ({ ...item, text: media.rewriteForSummary(item.text) })) : records2;
+        const prompt = buildPrompt({ sessionId: win.sessionId, messages: rewritten2 });
         const text = await llm.complete({
           messages: [{ role: 'user', content: prompt }],
           json: true,
@@ -223,6 +228,8 @@ export function createSessionSave({
         text,
         createdAt: Number.isFinite(Number(raw.createdAt)) ? Number(raw.createdAt) : at,
         kind: typeof raw.kind === 'string' && raw.kind.trim() ? raw.kind.trim() : 'text',
+        // 媒体元数据（save payload 可选字段，向后兼容）：供 ensureAssets 幂等建详情。
+        media: Array.isArray(raw.media) ? raw.media : [],
       });
     }
     if (records.length === 0) throw new Error('save 缓冲内没有可落地消息（全部缺 msgId/text）');
@@ -238,11 +245,48 @@ export function createSessionSave({
     // （2026-11-21 审计修复）：raw 照常落地，摘要记入 pendingWindows 由下次 save
     // 补写——L0 原文落地绝不被 LLM 可用性绑架（wb2api 长期挂时旧逻辑会导致记忆
     // 永远滞留网关缓冲）。
+    // 多媒体记忆层（2026-11-24）：
+    //   ① 占位符检测建/补详情——ensureAssets 幂等（历史窗口重放只补元数据），
+    //      hash 内容去重（转发/重发同图零重复解析）。事务外异步，失败不绑架 raw。
+    //   ② 摘要完整性检查——窗口内占位符必须带解释文字进摘要。降级阶梯：
+    //      已就绪 desc > analyzeSync 快解析（短超时）> 元数据最小描述，
+    //      绝不裸占位符进摘要。raw 层文本保持原占位符不动（永久锚点），
+    //      重写只发生在摘要 prompt 的输入（summarizeRecords）。
+    const allMedia = [];
+    for (const item of records) for (const mediaItem of item.media ?? []) allMedia.push(mediaItem);
+    if (media && allMedia.length) {
+      let assetRows = null;
+      try {
+        assetRows = await media.ensureAssets({ sessionId, media: allMedia });
+      } catch (error) {
+        logger(`save 媒体登记失败（${sessionId}）：${error?.message ?? error}（raw 照常落地）`);
+      }
+      // 记忆筛选旁路（媒体管道 v3 收藏语义重设计）：LLM 判定哪些媒体值得记住——
+      // keep 立即解析写 desc（=收藏生效，清退豁免）；skip 转 failed（后台不再扫、
+      // 超龄照常清退）。fire-and-forget，绝不阻塞 save 返回。
+      if (mediaAnalyzer?.screenForMemory && assetRows?.length) {
+        mediaAnalyzer.screenForMemory(assetRows.map((r) => r.id), { text: records.map((r) => r.text).join('\n') })
+          .catch((error) => logger(`save 媒体筛选失败（旁路，不阻塞）：${error?.message ?? error}`));
+      }
+    }
+    let summarizeRecords = records;
+    if (media) {
+      try {
+        const { missing } = media.collectFromTexts(records.map((item) => item.text));
+        if (missing.length && mediaAnalyzer) {
+          const sync = await mediaAnalyzer.analyzeSync(missing);
+          if (sync.resolved) logger(`save 摘要前快解析：${sync.resolved}/${sync.total} 就绪`);
+        }
+        summarizeRecords = records.map((item) => ({ ...item, text: media.rewriteForSummary(item.text) }));
+      } catch (error) {
+        logger(`save 摘要完整性检查异常（${sessionId}）：${error?.message ?? error}（用原文摘要）`);
+      }
+    }
     let parsed = null;
     let summaryUnavailable = false;
     if (!summaryExists) {
       if (usable()) {
-        const prompt = buildPrompt({ sessionId, messages: records });
+        const prompt = buildPrompt({ sessionId, messages: summarizeRecords });
         let text = null;
         try {
           text = await llm.complete({
