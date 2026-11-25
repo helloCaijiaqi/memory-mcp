@@ -1,0 +1,10 @@
+{
+  "gsvDir": "C:/memory-mcp/models/gpt-sovits/GPT-SoVITS-v2pro-20250604",
+  "runtimePython": "runtime/python.exe",
+  "apiScript": "api_v2.py",
+  "ttsYaml": "GPT_SoVITS/configs/memhub-tts.yaml",
+  "device": "cpu",
+  "apiPort": 9880,
+  "idleExitMs": 600000,
+  "memFreeRatio": 0.15
+}

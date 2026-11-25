@@ -54,7 +54,7 @@ function textOf(value) {
 
 export async function migrate(args) {
   const sourceRoot = path.resolve(args.source);
-  const stateDir = path.resolve(args.stateDir || path.join(PKG_ROOT, 'state'));
+  const stateDir = path.resolve(args.stateDir || path.join(PKG_ROOT, 'state', 'data'));
   const report = { source: sourceRoot, stateDir, slang: { source: 0, imported: 0, skipped: [] }, memory: { source: 0, imported: 0, skipped: [] }, backups: [] };
 
   const slangFile = path.join(sourceRoot, 'state', 'slang.json');

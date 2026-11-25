@@ -22,6 +22,10 @@ import { createSubjectService } from './service/subject-service.js';
 import { createSessionSave } from './service/session-save.js';
 import { createRelationGuard } from './service/relation-guard.js';
 import { createLlmProvider } from './llm-provider.js';
+import { loadEnvFile } from './load-env.js';
+import { createModelSupervisor, createMediaModelAdapter } from './service/model-supervisor.js';
+import { createVoiceSynthWorker } from './service/voice-synth.js';
+import { createVoiceBank } from './service/voice-bank.js';
 import { createHttpApi } from './http-api.js';
 import { serveStdio } from './mcp-memory.js';
 
@@ -89,6 +93,11 @@ function resolveLlmConfig(env, warn) {
     ...(env.MEMORY_MCP_LLM_VISION_API_KEY ? { apiKey: env.MEMORY_MCP_LLM_VISION_API_KEY } : (visionRaw.apiKey ? { apiKey: String(visionRaw.apiKey) } : {})),
     ...(visionRaw.timeoutMs != null ? { timeoutMs: num(visionRaw.timeoutMs, 45_000) } : {}),
   };
+  // audio/video 子配置透传（2026-11-25）：resolveLlmConfig 此前只解析 vision，
+  // audio（libDir 等）在 server.mjs 这层被丢弃 → llm-provider 恒拿到 null →
+  // 语音资产的 loadAudio 找不到 libDir 全部 no-audio-data。这里原样透传文件块。
+  const audioRaw = file.audio && typeof file.audio === 'object' ? file.audio : null;
+  const videoRaw = file.video && typeof file.video === 'object' ? file.video : null;
   return {
     enabled: merged.enabled === true || String(merged.enabled ?? '') === '1',
     baseUrl: merged.baseUrl ?? '',
@@ -96,22 +105,31 @@ function resolveLlmConfig(env, warn) {
     model: merged.model ?? '',
     timeoutMs: num(merged.timeoutMs, 20_000),
     vision,
+    ...(audioRaw ? { audio: audioRaw } : {}),
+    ...(videoRaw ? { video: videoRaw } : {}),
     source: hasEnv ? 'env' : (hasFile ? 'file' : 'none'),
   };
 }
 
 export function resolveConfig(env = process.env) {
   // MEMORY_MCP_DATA_DIR 是文档里的旧名字：两个都认，避免升级后旧部署「换了目录还不自知」。
-  const stateDir = path.resolve(env.MEMORY_MCP_STATE_DIR ?? env.MEMORY_MCP_DATA_DIR ?? path.join(PKG_ROOT, 'state'));
+  // 严格布局（2026-11-25）：state 按类型分目录——
+  //   state/data/    = 机器运行数据（memory.db、media/、raw-archive/、vision-cache/、backups/）
+  //   state/secrets/ = 安全敏感（http-token，0600）
+  // MEMORY_MCP_STATE_DIR 语义保持「数据目录」重定位（测试/搬盘用）；secrets 固定
+  // <repo>/state/secrets（token 一次性生成，极少随盘搬；ensureToken 兼容旧位置迁移）。
+  const stateDir = path.resolve(env.MEMORY_MCP_STATE_DIR ?? env.MEMORY_MCP_DATA_DIR ?? path.join(PKG_ROOT, 'state', 'data'));
+  const secretsDir = path.resolve(path.join(PKG_ROOT, 'state', 'secrets'));
   return {
     stateDir,
+    secretsDir,
     // 分层注入（head/tail + 原始层 + 关系 + 召回）的灰度开关：默认开，`=0` 只留旧接口。
     // 默认开是因为桥接已经按新契约改造；开关的存在是为了「出问题时一条环境变量回退」。
     layersV2: String(env.MEMORY_LAYERS_V2 ?? '1') !== '0',
     port: num(env.MEMORY_MCP_HTTP_PORT, 7181),
     host: '127.0.0.1',
     token: env.MEMORY_MCP_TOKEN ?? '',
-    readonlyTokenFile: path.join(stateDir, 'http-token'),
+    readonlyTokenFile: path.join(secretsDir, 'http-token'),
     // 网关接入：唯一来源是仓库根目录的 gateway.json——但不再在 resolveConfig
     // 里读取（启动期一次性绑定是「注册后必须重启」的根源）。改由 start() 里的
     // createGatewayWatcher 热加载：文件出现/修复/变更 ≤2s 自动生效。旧
@@ -146,6 +164,23 @@ export function resolveConfig(env = process.env) {
     // 关闭时 chat_memory_save 跳过摘要/画像/关系步骤（raw + alias + 纪元照常
     // 落地），长期层退化为「record / 手动巩固」，行为与旧版一致。
     llm: resolveLlmConfig(env, (msg) => console.error(`[memory-mcp] ${msg}`)),
+    // 专用模型子进程（model-hub，2026-11-25）：ASR 等专职服务随 memory 一起
+    // spawn 监管；识图阶段一走 LLM vision 兜底（visionMode='llm-fallback'）。
+    modelHub: {
+      asr: {
+        enabled: String(env.MEMORY_MCP_MODEL_HUB_ASR ?? '1') !== '0',
+        port: num(env.MEMORY_MCP_MODEL_HUB_ASR_PORT, 18102),
+      },
+      tts: {
+        // 2026-11-25 起 GPT-SoVITS 集成包就位，默认启用（tts-svc 自带水位保护，
+        // 内存不足时 E_BUSY 降级）；MEMORY_MCP_MODEL_HUB_TTS=0 可显式关闭。
+        enabled: String(env.MEMORY_MCP_MODEL_HUB_TTS ?? '1') !== '0',
+        port: num(env.MEMORY_MCP_MODEL_HUB_TTS_PORT, 18103),
+      },
+      visionMode: env.MEMORY_MCP_MODEL_HUB_VISION_MODE ?? 'llm-fallback',
+      // 阶段二：visionMode='vision-svc' 时 spawn subprocesses/vision-svc（外部识图聚合）
+      visionPort: num(env.MEMORY_MCP_MODEL_HUB_VISION_PORT, 18104),
+    },
     memory: {
       sessionIdleMs: num(env.MEMORY_MCP_SESSION_IDLE_MINUTES, 60) * MINUTE_MS,
     },
@@ -158,15 +193,31 @@ export function resolveConfig(env = process.env) {
   };
 }
 
-/** 本地令牌：优先用环境变量，否则在 state/ 里生成一份（权限收紧，与 qq-bridge/state 同处理）。 */
+/** 本地令牌：优先用环境变量，否则在 state/secrets/ 里生成一份（0600，与数据文件物理分离）。
+ *  旧布局兼容：state/http-token（升级前）存在则自动搬进 secrets/，桥接无感。 */
 function ensureToken(cfg) {
   if (cfg.token) return cfg.token;
-  fs.mkdirSync(cfg.stateDir, { recursive: true });
+  fs.mkdirSync(cfg.secretsDir, { recursive: true });
   try {
     const existing = fs.readFileSync(cfg.readonlyTokenFile, 'utf8').trim();
     if (existing) return existing;
   } catch {
-    /* 还没生成过 */
+    /* secrets/ 还没生成过 */
+  }
+  // 旧位置迁移：state/http-token → state/secrets/http-token（rename 失败降级 copy）
+  const legacyTokenFile = path.join(PKG_ROOT, 'state', 'http-token');
+  try {
+    const legacy = fs.readFileSync(legacyTokenFile, 'utf8').trim();
+    if (legacy) {
+      try {
+        fs.renameSync(legacyTokenFile, cfg.readonlyTokenFile);
+      } catch {
+        fs.copyFileSync(legacyTokenFile, cfg.readonlyTokenFile);
+      }
+      return legacy;
+    }
+  } catch {
+    /* 旧布局也没有 */
   }
   const token = crypto.randomBytes(24).toString('hex');
   fs.writeFileSync(cfg.readonlyTokenFile, `${token}\n`, { encoding: 'utf8', mode: 0o600 });
@@ -179,8 +230,13 @@ function ensureToken(cfg) {
 }
 
 export async function start({ env = process.env, stdio = true, http: withHttp = true, logger } = {}) {
+  // .env 装载（2026-11-25）：MEMORY_MCP_* 配置的显性载体——根目录 .env（gitignored，
+  // 模板 .env.example）。真实 env > .env > 默认值；装载的键打日志，配过什么可查证。
+  const envApplied = loadEnvFile(PKG_ROOT, env);
+  const log0 = logger ?? ((...args) => console.error('[memory-mcp]', ...args));
+  if (envApplied.length) log0(`.env 已装载 ${envApplied.length} 项：${envApplied.join(', ')}`);
   const cfg = resolveConfig(env);
-  const log = logger ?? ((...args) => console.error('[memory-mcp]', ...args));
+  const log = logger ?? log0;
   const token = ensureToken(cfg);
 
   const store = await openStore({ dir: cfg.stateDir });
@@ -212,6 +268,15 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
   const raw = createRawService({ store, stateDir: cfg.stateDir, config: cfg.raw, logger: { log } });
   const llm = createLlmProvider(cfg.llm);
 
+  // 专用模型子进程监管（2026-11-25）：spawn asr-svc 等本地专职服务，媒体识别
+  // 经 adapter 走子服务（语音）与 LLM 兜底（识图，阶段一）；随 memory 生命周期启停。
+  // 子服务 token 与 http-token 同源（2026-11-26）：此前 supervisor 每次启动随机生成，
+  // 子服务 token 随重启轮换且无法外部探活；统一用 ensureToken 的持久 token。
+  const modelHub = createModelSupervisor({ config: { ...(cfg.modelHub ?? {}), token }, logger: log });
+  modelHub.start();
+  // 媒体识别 adapter：与 llmProvider 同形状——analyzer 注入它而非裸 llm。
+  const mediaLlm = createMediaModelAdapter({ llm, hub: modelHub });
+
   // 多媒体记忆层（media memory tier）：详情表服务 + 解析兜底队列（2026-11-24）。
   // mediaDir 固定 state/media（源文件落盘，sha256 命名）；analyzer 是可选 LLM 的
   // 旁路（vision key 未配置时保持 pending 积压，不影响登记/摘要链路）。
@@ -223,8 +288,25 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
     repairPlaceholder: (id, retiredText) =>
       mediaRetention.repairPlaceholderBatch(store, [id], retiredText ?? undefined, log),
   });
-  const mediaAnalyzer = createMediaAnalyzer({ store, service: media, llm, logger: log });
+  const mediaAnalyzer = createMediaAnalyzer({ store, service: media, llm: mediaLlm, logger: log });
   mediaAnalyzer.start();
+  // voice-bank 角色音色库（voice_bank.json）：角色→关键词→情绪→参考音频；
+  // inbox 暂存超龄清理随进程周期运行。
+  const voiceBank = createVoiceBank({
+    bankPath: path.join(cfg.stateDir, 'voice_bank.json'), // 严格布局：运行时可变数据归 state/data（随 npm run backup 备份）
+    defaultLibDir: llm?.config?.audio?.libDir ?? '',
+    logger: log,
+  });
+  voiceBank.start();
+  // voice-synth 异步合成 worker（chat_voice_synthesize 工具链）：文本 → 克隆音色
+  // 语音落 voice_lib（qq-bridge audio/）。TTS 子服务随 GPT-SoVITS 集成包启用。
+  const voiceSynth = createVoiceSynthWorker({
+    media,
+    hub: modelHub,
+    bank: voiceBank,
+    config: { voiceLibDir: llm?.config?.audio?.libDir ?? '' },
+    logger: log,
+  });
   // 媒体缺省清退（媒体管道 v2）：未收藏且超龄（缺省 30 天）的资产删源文件+删记录，
   // 删行时批量修复摘要/raw 占位符；收藏豁免。配置 config.json mediaRetention 块。
   const mediaRetention = createMediaRetention({ store, media, config: cfg.mediaRetention ?? {}, logger: log });
@@ -290,6 +372,10 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
         media,
         // chat_media_describe 主动解析需要 analyzer 的 analyzeOne（媒体管道 v3）
         mediaAnalyzer,
+        // chat_voice_synthesize 主动开口说话（voice-synth 异步 worker）
+        voiceSynth,
+        // chat_voice_bank_list / chat_voice_bank_add（角色音色库）
+        voiceBank,
         logger: log,
       });
     } else {
@@ -420,6 +506,8 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
     log(`收到 ${signal}，正在关闭（http/store）…`);
     try { if (api && !httpError) await api.close(); } catch { /* 已关 */ }
     try { gatewayWatcher.stop(); } catch { /* 已关 */ }
+    try { voiceSynth.stop(); } catch { /* 已关 */ }
+    try { modelHub.stop(); } catch { /* 已关 */ }
     try { store.close?.(); } catch { /* 已关 */ }
     process.exit(0);
   };
@@ -429,7 +517,7 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
     await serveStdio({ memory, slang, relation, raw, recall, media, mediaAnalyzer });
     log('stdio MCP 已连接');
   }
-  return { cfg, store, memory, slang, media, mediaAnalyzer, relation, raw, recall, profile, subject, sessionSave, guard, llm, api: httpError ? null : api, token, httpError, info, gatewayWatcher };
+  return { cfg, store, memory, slang, media, mediaAnalyzer, relation, raw, recall, profile, subject, sessionSave, guard, llm, modelHub, api: httpError ? null : api, token, httpError, info, gatewayWatcher };
 }
 
 const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

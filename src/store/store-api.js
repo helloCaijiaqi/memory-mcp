@@ -213,8 +213,12 @@ export function normalizeMediaRow(row, { now = nowMs() } = {}) {
     durationMs: durationRaw != null && Number.isFinite(durationRaw) ? Math.max(0, Math.round(durationRaw)) : null,
     status,
     useCount: clampInt(row.useCount, 0, 1e9, 0),
-    // favorited 字段退役（媒体管道 v3 收藏语义重设计）：列保留弃用，不再读映射
     lastUsedAt: row.lastUsedAt != null ? clampInt(row.lastUsedAt, 0, Number.MAX_SAFE_INTEGER, now) : null,
+    // 表情库三字段（v6 迁移）：phash 16 位十六进制感知哈希 / merged_into 归并主资产 id /
+    // is_sticker 表情判定（analyzer 启发式写入）
+    phash: String(row.phash ?? '').trim(),
+    mergedInto: String(row.mergedInto ?? '').trim(),
+    isSticker: row.isSticker === true || row.isSticker === 1,
     createdAt: clampInt(row.createdAt, 0, Number.MAX_SAFE_INTEGER, now),
     // updatedAt 可覆盖（媒体管道 v2）：清退/修复场景按内容回写时间戳；常规登记不传即 now。
     updatedAt: row.updatedAt != null ? clampInt(row.updatedAt, 0, Number.MAX_SAFE_INTEGER, now) : now,

@@ -1,5 +1,5 @@
 // 落地数据盘点（只读）：raw / 摘要 / 快照 / 长期记忆 / 画像 / 关系 / 媒体资产。
-// 用内置 node:sqlite（与 src/store/sqlite-store.js 同驱动），state/memory.db 只读打开。
+// 用内置 node:sqlite（与 src/store/sqlite-store.js 同驱动），state/data/memory.db 只读打开。
 import { DatabaseSync } from 'node:sqlite';
 const db = new DatabaseSync('state/memory.db', { readOnly: true });
 const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name);

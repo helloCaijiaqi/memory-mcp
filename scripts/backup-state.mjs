@@ -32,7 +32,8 @@ function prune(backupDir, keep) {
 }
 
 export function backupState({ stateDir, keep = KEEP, logger = console.log } = {}) {
-  const dir = path.resolve(stateDir ?? process.env.MEMORY_MCP_STATE_DIR ?? path.join(PKG_ROOT, 'state'));
+  // 严格布局：默认备份 state/data（机器数据）；token 在 state/secrets/ 单独补一份。
+  const dir = path.resolve(stateDir ?? process.env.MEMORY_MCP_STATE_DIR ?? path.join(PKG_ROOT, 'state', 'data'));
   const dbPath = path.join(dir, 'memory.db');
   if (!fs.existsSync(dbPath)) {
     logger(`[backup] 没有记忆库（${dbPath}），无需备份`);
@@ -53,7 +54,7 @@ export function backupState({ stateDir, keep = KEEP, logger = console.log } = {}
     db.close();
   }
 
-  const tokenFile = path.join(dir, 'http-token');
+  const tokenFile = path.join(PKG_ROOT, 'state', 'secrets', 'http-token');
   if (fs.existsSync(tokenFile)) fs.copyFileSync(tokenFile, path.join(backupDir, 'http-token.bak'));
 
   const removed = prune(backupDir, keep);

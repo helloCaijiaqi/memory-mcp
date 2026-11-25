@@ -8,7 +8,7 @@
 // 为什么不用 SCHEMA 改表：SCHEMA 靠 IF NOT EXISTS 执行，对「表已存在但缺列」完全无效，
 // 老库会静默缺列（写入报错或字段丢失），这类问题在生产上极难定位。
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS memory (
@@ -152,14 +152,17 @@ CREATE TABLE IF NOT EXISTS media_asset (
   status       TEXT NOT NULL DEFAULT 'pending',
   use_count    INTEGER NOT NULL DEFAULT 0,
   last_used_at INTEGER,
-  favorited    INTEGER NOT NULL DEFAULT 0,
+  phash        TEXT NOT NULL DEFAULT '',
+  merged_into  TEXT NOT NULL DEFAULT '',
+  is_sticker   INTEGER NOT NULL DEFAULT 0,
   created_at   INTEGER NOT NULL,
   updated_at   INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_media_fav     ON media_asset(favorited, updated_at);
 CREATE INDEX IF NOT EXISTS idx_media_status  ON media_asset(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_media_session ON media_asset(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_media_hash    ON media_asset(hash) WHERE hash != '';
+-- 注意：表情库新列的部分索引（idx_media_phash / idx_media_sticker）只能在 MIGRATIONS v6 建——
+-- SCHEMA 在迁移【之前】执行，旧库还没有 phash/is_sticker 列，在这里引用会抛错触发只读降级。
 CREATE VIRTUAL TABLE IF NOT EXISTS media_fts USING fts5(desc, tags, id UNINDEXED, tokenize = 'trigram');
 `;
 
@@ -374,6 +377,24 @@ export const MIGRATIONS = [
       //     已退役，收藏判断归 DSH，经 chat_media_favorite 标记（前置存在检查）。
       `ALTER TABLE media_asset ADD COLUMN favorited INTEGER NOT NULL DEFAULT 0`,
       `CREATE INDEX IF NOT EXISTS idx_media_fav ON media_asset(favorited, updated_at)`,
+    ],
+  },
+  {
+    version: 6,
+    statements: [
+      // --- 表情库（表情 pHash 识别与检索，2026-11-26）：
+      //     phash = 64 位感知哈希十六进制（src/service/image-phash.js，识别重编码/变体同图）；
+      //     merged_into = 变体归并的主资产 id（归并变体继承主资产 desc/tags，检索默认排除）；
+      //     is_sticker = 表情判定（analyzer 启发式：短边/字节数 + 描述含表情关键词）。
+      //     同时删除 favorited（2026-11-26 口径确认：进入详情表即收藏，列是永远为 0/1 的死列；
+      //     use_count/last_used_at 保留——表情常用度排序支柱）。
+      `ALTER TABLE media_asset ADD COLUMN phash TEXT NOT NULL DEFAULT ''`,
+      `ALTER TABLE media_asset ADD COLUMN merged_into TEXT NOT NULL DEFAULT ''`,
+      `ALTER TABLE media_asset ADD COLUMN is_sticker INTEGER NOT NULL DEFAULT 0`,
+      `CREATE INDEX IF NOT EXISTS idx_media_phash ON media_asset(phash) WHERE phash != ''`,
+      `CREATE INDEX IF NOT EXISTS idx_media_sticker ON media_asset(is_sticker, use_count) WHERE is_sticker = 1`,
+      `DROP INDEX IF EXISTS idx_media_fav`,
+      `ALTER TABLE media_asset DROP COLUMN favorited`,
     ],
   },
 ];
@@ -605,7 +626,9 @@ export function mediaFromRow(row) {
     status: row.status,
     useCount: row.use_count ?? 0,
     lastUsedAt: row.last_used_at ?? null,
-    favorited: row.favorited === 1,
+    phash: row.phash ?? '',
+    mergedInto: row.merged_into ?? '',
+    isSticker: row.is_sticker === 1,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

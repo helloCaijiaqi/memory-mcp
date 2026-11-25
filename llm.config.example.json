@@ -4,9 +4,21 @@
   "apiKey": "<your-api-key>",
   "model": "cn:deepseek-v4.1-flash",
   "timeoutMs": 30000,
+  "_说明": "三类媒体各用各的专职模型（2026-11-25 分层），主 model 只做文本任务绝不解析媒体；子块 enabled+model 必须显式给出才启用，baseUrl/apiKey/timeoutMs 缺省继承主配置可覆盖；未配置的媒体类型保持 pending 等配置，绝不瞎编。",
   "vision": {
     "enabled": false,
     "model": "cn:glm-5.3-flash",
-    "timeoutMs": 45000
+    "timeoutMs": 45000,
+    "_说明": "vision 是链尾兜底：外部识图聚合切 MEMORY_MCP_MODEL_HUB_VISION_MODE=vision-svc 后，vision-svc 未命中才落回这里"
+  },
+  "audio": {
+    "enabled": false,
+    "libDir": "voice_lib 素材根目录（如 C:/qq-bridge/bridge/audio）——analyzer 据此读取 voice 资产的 ref 相对路径文件；不配则 voice 一律保持 pending",
+    "_说明": "voice 转写已本地化（subprocesses/asr-svc，sherpa-onnx，随 memory spawn），本块只需 enabled+libDir；llm-provider 的远端 audio 转写（baseUrl/apiKey/model/language）仅为无 supervisor 的独立部署保留"
+  },
+  "video": {
+    "enabled": false,
+    "model": "<video-understanding-model>",
+    "timeoutMs": 90000
   }
 }

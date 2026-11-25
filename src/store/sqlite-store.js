@@ -111,6 +111,8 @@ export function openSqliteStore({ dir, file = 'memory.db', logger = console, rea
         /* 关不掉就算了，下面重新开一个只读句柄 */
       }
       // 写权限缺失或文件损坏：能读就降级只读，绝不假装可写 —— 写失败必须由上层显式报给调用方。
+      // 2026-11-26 补：降级原因必须落日志（此前静默吞掉，排查「库没迁移」问题时无迹可循）。
+      logger?.error?.(`[store] SCHEMA 执行失败，降级只读：${error?.message ?? error}`);
       try {
         db = new DatabaseSync(dbPath, { readOnly: true });
         readonly = true;

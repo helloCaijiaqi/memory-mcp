@@ -17,3 +17,13 @@ run.err
 *.log
 _patch-*.cjs
 scripts/_probe-*.mjs
+
+
+# dedicated model weights (large binaries)
+models/
+
+# external vision API keys
+vision.config.json
+
+# 环境变量载体（可含密钥，模板见 .env.example）
+.env

@@ -41,8 +41,8 @@ export function createMediaCollection({ db, usable, writable, prepare }) {
       'medPut',
       `INSERT INTO media_asset (id, session_id, platform, kind, source_path, hash, origin, ref,
          send_hints, desc, tags, text_content, duration_ms, status, use_count, last_used_at,
-         created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         phash, merged_into, is_sticker, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          session_id = excluded.session_id, platform = excluded.platform,
          kind = excluded.kind, source_path = excluded.source_path, hash = excluded.hash,
@@ -50,8 +50,8 @@ export function createMediaCollection({ db, usable, writable, prepare }) {
          desc = excluded.desc, tags = excluded.tags, text_content = excluded.text_content,
          duration_ms = excluded.duration_ms, status = excluded.status,
          use_count = excluded.use_count, last_used_at = excluded.last_used_at,
-         updated_at = excluded.updated_at
-         -- favorited 不在 upsert 更新列：登记/重放幂等补元数据时不动（favorited 列已弃用——收藏语义重设计）
+         phash = excluded.phash, merged_into = excluded.merged_into,
+         is_sticker = excluded.is_sticker, updated_at = excluded.updated_at
        `,
     ).run(
       r.id,
@@ -70,6 +70,9 @@ export function createMediaCollection({ db, usable, writable, prepare }) {
       r.status,
       r.useCount,
       r.lastUsedAt,
+      r.phash,
+      r.mergedInto,
+      r.isSticker ? 1 : 0,
       createdAt,
       r.updatedAt,
     );
@@ -106,8 +109,13 @@ export function createMediaCollection({ db, usable, writable, prepare }) {
       where.push('m.hash = ?');
       params.push(String(opts.hash));
     }
-    // favOnly 过滤分支已退役（媒体管道 v3 收藏语义重设计）：「被记住」= status='ready'，
-    // 由调用方直接传 status 过滤；favorited 列保留弃用。
+    if (opts.stickerOnly) {
+      where.push('m.is_sticker = 1');
+    }
+    // 归并变体默认不出现在检索面（与主资产重复；media_describe 单查 get() 不受限）。
+    if (!opts.includeMerged) {
+      where.push("m.merged_into = ''");
+    }
     const whereSql = where.length ? `AND ${where.join(' AND ')}` : '';
     const text = String(opts.text ?? '').trim();
 
@@ -156,6 +164,14 @@ export function createMediaCollection({ db, usable, writable, prepare }) {
     return Number(db.prepare(sql).get(...params)?.n ?? 0);
   }
 
-  // setFavorite 已退役（收藏语义重设计——favorited 列保留弃用）
-  return { get, put, remove, query, count };
+  // setFavorite 已退役（收藏语义重设计——favorited 列已随 v6 迁移删除）
+  // pHash 近邻候选（表情库近似匹配）：暴力扫描，表情库几千规模微秒级，无需向量索引。
+  // 只扫未归并资产（变体已并入主资产）；距离计算在 service 层（hamming 来自 image-phash.js）。
+  function phashCandidates(limit = 5000) {
+    if (!usable()) return [];
+    const sql = `SELECT * FROM media_asset WHERE phash != '' AND merged_into = ''
+                 ORDER BY use_count DESC LIMIT ?`;
+    return db.prepare(sql).all(Math.max(1, Math.min(20000, Math.round(limit)))).map(mediaFromRow);
+  }
+  return { get, put, remove, query, count, phashCandidates };
 }

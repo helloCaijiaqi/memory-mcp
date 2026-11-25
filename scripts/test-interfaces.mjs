@@ -22,7 +22,9 @@ function tmpState() {
 async function withApi(fn, extraEnv = {}) {
   const dir = tmpState();
   const app = await start({
-    env: { MEMORY_MCP_STATE_DIR: dir, MEMORY_MCP_HTTP_PORT: '0', MEMORY_MCP_TOKEN: 'test-token', ...extraEnv },
+    // MODEL_HUB_ASR=0：withApi 每次调用都 start() 一遍，不关 hub 会给每个测试
+    // 实例 spawn 一份 asr-svc/tts-svc（模型 230MB/个 + 子进程常驻不退），端口争抢风暴拖死整个测试文件。
+    env: { MEMORY_MCP_STATE_DIR: dir, MEMORY_MCP_HTTP_PORT: '0', MEMORY_MCP_TOKEN: 'test-token', MEMORY_MCP_MODEL_HUB_ASR: '0', MEMORY_MCP_MODEL_HUB_TTS: '0', ...extraEnv },
     stdio: false,
     logger: () => {},
   });
@@ -245,7 +247,7 @@ test('HTTP：未知路由 404', async () => {
 async function mcpSession(requests, { timeoutMs = 8000 } = {}) {
   const dir = tmpState();
   const child = spawn(process.execPath, [SERVER], {
-    env: { ...process.env, MEMORY_MCP_STATE_DIR: dir, MEMORY_MCP_HTTP_PORT: '0' },
+    env: { ...process.env, MEMORY_MCP_STATE_DIR: dir, MEMORY_MCP_HTTP_PORT: '0', MEMORY_MCP_MODEL_HUB_ASR: '0', MEMORY_MCP_MODEL_HUB_TTS: '0' },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   const stdout = [];

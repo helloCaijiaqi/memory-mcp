@@ -240,6 +240,29 @@ export function createMcpMemoryServer({ memory, slang, relation, raw, recall, me
       },
     );
     server.tool(
+      'sticker_find',
+      '从表情库找一张合适的表情（三级检索：文本语义 > 常用度）。返回 mediaId 与描述——发送时把 mediaId 交给网关的媒体发送工具。新图识别用 media_describe；本工具只查已入账的表情。',
+      {
+        text: z.string().optional().describe('想要什么表情（画面/含义关键词，如「猫猫看表」）'),
+        limit: z.number().int().min(1).max(20).optional(),
+      },
+      async (args) => {
+        const rows = media.stickerFind({ text: args.text, limit: args.limit });
+        return ok({
+          hits: rows.length,
+          results: rows.map((r) => ({
+            mediaId: r.id,
+            desc: r.desc,
+            tags: r.tags,
+            useCount: r.useCount,
+            sourcePath: r.sourcePath,
+            matchType: r.matchType,
+            distance: r.distance ?? null,
+          })),
+        });
+      },
+    );
+    server.tool(
       'media_describe',
       '主动解析图片内容：vision 模型看图返回描述并回写详情表（ready 直接返回缓存描述）。收藏语义重设计后无需收藏动作——进入详情表且被解析的媒体即被记住。',
       {

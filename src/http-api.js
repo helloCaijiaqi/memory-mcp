@@ -134,6 +134,9 @@ export function createHttpApi({
       ['/api/media/mark-used', (args) => media.markUsed(args.id)],
       ['/api/media/analyze', () => (mediaAnalyzer ? mediaAnalyzer.analyzeBatch() : { skipped: true })],
       ['/api/media/stats', () => (mediaAnalyzer ? mediaAnalyzer.stats() : { enabled: false })],
+  // 表情库三级检索（2026-11-26）：{text} 或 {imageBase64, mime}——带图走 pHash 感知匹配
+  // （贴纸尺寸图 base64 约 0.4MB，1MB body 上限内）；纯检索不消耗识图配额。
+  ['/api/sticker/find', (args) => media.stickerFind(args)],
     ] : []),
     ['/api/blocks/render', (args) => {
       const memoryBlocks = memory.render({ sessionId: args.sessionId, maxChars: args.maxChars }).blocks;

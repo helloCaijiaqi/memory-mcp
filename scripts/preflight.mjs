@@ -270,13 +270,13 @@ export async function preflight({ env = process.env, logger = console.log } = {}
   results.length = 0;
   currentLogger = typeof logger === 'function' ? logger : console.log;
   // 与 server.mjs 的 resolveConfig 同一条解析顺序：旧名字 MEMORY_MCP_DATA_DIR 也认。
-  const stateDir = path.resolve(env.MEMORY_MCP_STATE_DIR ?? env.MEMORY_MCP_DATA_DIR ?? path.join(PKG_ROOT, 'state'));
+  const stateDir = path.resolve(env.MEMORY_MCP_STATE_DIR ?? env.MEMORY_MCP_DATA_DIR ?? path.join(PKG_ROOT, 'state', 'data'));
   const port = Number(env.MEMORY_MCP_HTTP_PORT ?? 7181);
 
   checkNode();
   await checkDeps();
   checkStateDir(stateDir);
-  checkToken(path.join(stateDir, 'http-token'));
+  checkToken(path.join(PKG_ROOT, 'state', 'secrets', 'http-token'));
   checkLayers(env);
   checkPlatforms(env);
   await checkStore(stateDir, env);

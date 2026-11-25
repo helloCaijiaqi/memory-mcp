@@ -126,14 +126,14 @@ const MEDIA_GUIDANCE_SECTION = {
   text: [
     '【媒体占位符语义】消息与记忆文本里的 [图片|ma_xxx] / [语音|…] / [视频|…] / [文件|…] / [表情|…] 是媒体内容占位符（ma_xxx 是媒体资产 id）：',
     '- 它只代表一张图/一段语音等媒体内容，不是消息 id——绝不要把它当 replyToMessageId 等消息标识使用；',
-    '- 想看图的内容：调用 chat_media_describe（会解析图片返回描述）；想发表情/图片：先用 chat_media_search 拿候选列表（按语义匹配×使用热度随机采样，从中挑一个），再用 chat_media_send 发送；',
+    '- 想看图的内容：调用 chat_media_describe（会解析图片返回描述）；想发图片/表情：先用 chat_media_search 拿候选列表（按语义匹配×使用热度随机采样，从中挑一个），再用 chat_image_send 发送；发语音用 chat_voice_send，发文件用 chat_file_send；',
     '- 媒体是否被记住是自动的：被记忆服务解析过的媒体会长期保留并优先注入，无需收藏动作。',
   ].join('\n'),
   priority: 40,
 };
 
 export function createGatewayV1({
-  mediaAnalyzer = null, auth, memory, recall, subject, sessionSave, media, logger } = {}) {
+  mediaAnalyzer = null, voiceSynth = null, voiceBank = null, auth, memory, recall, subject, sessionSave, media, logger } = {}) {
   const log = logger ?? (() => {});
 
   // ── 工具面：chat_memory_* → 内部 service 方法（与 /api/* 同一实现，不复制业务）──
@@ -271,6 +271,62 @@ export function createGatewayV1({
       }
       return { ok: false, reason: result?.reason ?? 'vision-failed', mediaId: id, note: '暂无法解析（视觉模型不可用或内容取不到），已转入后台队列重试' };
     },
+    // 主动开口说话（voice-synth 工具面，2026-11-25）：文本 → 克隆音色合成语音
+    // 入 voice_lib。异步任务：立即返回 mediaId(status=synthesizing)，合成完成后
+    // ready，再用 chat_voice_send 发送（未 ready 走既有 E_NOT_READY 降级）。
+    chat_voice_synthesize: async (args, ctx) => {
+      if (!voiceSynth) throw new Error('语音合成 worker 未装配（检查 server.mjs）');
+      const text = String(args?.text ?? '').trim();
+      if (!text) throw new Error('text 必填：要说的话');
+      const result = await voiceSynth.submit({
+        text,
+        sessionId: requireText(ctx?.sessionKey, 'sessionKey'),
+        role: args?.role,
+        emotion: args?.emotion,
+        personaKeywords: args?.personaKeywords,
+      });
+      if (!result.ok) return { ok: false, reason: result.reason, note: result.note ?? '语音合成未就绪' };
+      return {
+        ok: true,
+        mediaId: result.mediaId,
+        role: result.role,
+        emotion: result.emotion,
+        status: 'synthesizing',
+        note: '正在用克隆音色合成（CPU 需 25-70 秒），稍后用 chat_media_get 查询状态，ready 后用 chat_voice_send 发送',
+      };
+    },
+    // 音色库查询（voice-bank 工具面）：LLM 选角色/情绪前先看可用清单
+    chat_voice_bank_list: async () => {
+      if (!voiceBank) throw new Error('voice-bank 未装配（检查 server.mjs）');
+      return {
+        ok: true,
+        roles: voiceBank.listRoles(),
+        note: 'chat_voice_synthesize 传 role + emotion（从该角色 emotions 集合里选）；不传 role 时按 personaKeywords 自动匹配角色',
+      };
+    },
+    // 音色归档：把听到的语音暂存文件登记为某角色某情绪的克隆参考音频
+    chat_voice_bank_add: async (args) => {
+      if (!voiceBank) throw new Error('voice-bank 未装配（检查 server.mjs）');
+      const id = String(args?.mediaId ?? '').trim();
+      if (!/^ma_[0-9a-f]{12}$/.test(id)) throw new Error('mediaId 必须是 ma_ 开头的 12 位十六进制占位符 id');
+      const asset = media.get(id);
+      if (!asset) throw new Error(`媒体资产不存在：${id}`);
+      if (asset.kind !== 'voice') throw new Error(`只能归档语音资产（当前 kind=${asset.kind}）`);
+      const result = voiceBank.promote({
+        sourcePath: asset.sourcePath,
+        role: args?.role,
+        emotion: args?.emotion,
+        promptText: args?.promptText ?? asset.textContent ?? '',
+      });
+      const notes = {
+        'source-missing': '源文件已不在：语音源文件转写后只暂存 3 天（inbox），请用近期语音归档',
+        'prompt-text-required': 'promptText 必填：参考音频里说的那句话（GPT-SoVITS 克隆需要文本对齐）',
+        'voice-lib-not-configured': 'voice_lib 未配置（voice_bank.json voiceLibDir）',
+        'role-required': 'role 必填：归档到哪个角色',
+      };
+      if (!result.ok) return { ok: false, reason: result.reason, note: notes[result.reason] ?? '归档失败' };
+      return { ok: true, mediaId: id, role: result.role, emotion: result.emotion, ref: result.ref };
+    },
     chat_memory_recall: (args, ctx) => {
       if (!recall) throw new Error('recall 服务未装配（检查 server.mjs）');
       const sessionKey = requireText(ctx?.sessionKey, 'sessionKey');
@@ -357,6 +413,9 @@ export function createGatewayV1({
     { name: 'chat_media_record', role: 'tool', description: '登记多媒体资产（网关实时旁路：hashId→fileRef/url 指导清单，幂等）', inputSchema: { type: 'object' } },
     { name: 'chat_media_note', role: 'tool', description: '回写媒体认知：对看过的媒体补充描述/标签（mediaId 必须已存在）', inputSchema: { type: 'object' } },
     { name: 'chat_media_describe', role: 'tool', description: '主动解析图片内容：vision 模型看图返回描述并回写详情表（ready 直接返回缓存描述；超时降级后台队列）', inputSchema: { type: 'object' } },
+    { name: 'chat_voice_synthesize', role: 'tool', description: '主动开口说话：把要说的话用克隆音色合成语音（异步，立即返回 mediaId；role+emotion 指定音色与情绪，可先用 chat_voice_bank_list 查可用角色；不传 role 按人设关键词自动匹配）', inputSchema: { type: 'object' } },
+    { name: 'chat_voice_bank_list', role: 'tool', description: '查询音色库：可用角色、人设关键词、各角色支持的情绪集', inputSchema: { type: 'object' } },
+    { name: 'chat_voice_bank_add', role: 'tool', description: '音色归档：把一条已转写的语音登记为某角色某情绪的克隆参考音频（语音源文件只暂存 3 天，尽快归档）', inputSchema: { type: 'object' } },
   ];
 
   const endpoints = new Map([

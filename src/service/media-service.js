@@ -9,8 +9,12 @@
 //   4. 源文件落盘按 sha256 命名：同内容只存一份
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { MEDIA_ID_RE, MEDIA_PLACEHOLDER_RE, MEDIA_KINDS } from '../store/store-api.js';
+import {
+  phashFromFile, hamming, PHASH_CONFIRM_DISTANCE, PHASH_CANDIDATE_DISTANCE,
+} from './image-phash.js';
 
 export const DEFAULT_MEDIA_CONFIG = {
   mediaDir: '',             // 源文件落盘根目录（如 <repo>/state/media）；空 = 不落盘只留 ref
@@ -150,6 +154,10 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
       if (!item || typeof item !== 'object') continue;
       const id = String(item.id ?? '');
       if (!MEDIA_ID_RE.test(id)) continue;
+      // 视频/其他文件不进收藏详情表（2026-11-25 用户裁定）：不留源文件、不登记。
+      // 记忆文本里的占位符由 renderPlaceholders 渲染为最小文字。
+      const kind0 = String(item.kind ?? '').trim().toLowerCase();
+      if (kind0 === 'video' || kind0 === 'file') continue;
       const existing = m.get(id);
       if (existing) {
         const patch = {};
@@ -198,7 +206,7 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
   }
 
   // ---------- 描述回写（网关/DSH/media-analyzer 三方共用入口） ----------
-  function updateDesc(id, { desc, tags, textContent, status } = {}) {
+  function updateDesc(id, { desc, tags, textContent, status, phash, isSticker } = {}) {
     const existing = m.get(String(id));
     if (!existing) return null;
     const next = { ...existing };
@@ -218,6 +226,9 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
     if (typeof textContent === 'string' && textContent.trim()) next.textContent = textContent.trim();
     if (status === 'ready' || status === 'failed') next.status = status;
     else if ((next.desc || next.textContent) && next.status === 'pending') next.status = 'ready';
+    // 表情库字段（2026-11-26）：phash 16 位十六进制；isSticker 表情判定
+    if (typeof phash === 'string' && /^[\da-f]{1,16}$/i.test(phash.trim())) next.phash = phash.trim().toLowerCase();
+    if (isSticker != null) next.isSticker = Boolean(isSticker);
     return m.put(next);
   }
 
@@ -298,6 +309,97 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
   const scanPending = ({ limit = 20 } = {}) =>
     m.query({ status: 'pending', limit, order: 'oldest' }).rows;
 
+  // ---------- 表情库：pHash 近邻识别 / 变体归并 / 三级检索（2026-11-26） ----------
+  // 设计口径（表情库计划确认稿）：
+  //   汉明距离 ≤6 确认同款（自动归并）；7~12 候选区（仅提示不合并）；同模板不同
+  //   文字通常 ≥10 天然分开。误合并（发错表情）比漏识别伤害大，阈值宁紧勿松。
+
+  /** pHash 近邻：扫描未归并资产找距离最近者。JSON 兜底后端无 pHash 列，返回 null。 */
+  function findNearPhash(hashHex, maxDistance = PHASH_CONFIRM_DISTANCE) {
+    if (!hashHex || typeof m.phashCandidates !== 'function') return null;
+    let best = null;
+    for (const candidate of m.phashCandidates(5000)) {
+      const distance = hamming(hashHex, candidate.phash);
+      if (distance <= maxDistance && (!best || distance < best.distance)) {
+        best = { asset: candidate, distance };
+      }
+    }
+    return best;
+  }
+
+  /**
+   * 变体归并：variant 视觉同款于 master（距离 ≤6）→ 继承 desc/tags 并置 ready、
+   * 标 merged_into（检索面默认排除变体）；sightings 计数归并到主资产（+1）。
+   * 「长期使用」的常用度排序依据——同一表情无论以多少字节变体出现，热度只累计在主资产。
+   */
+  function mergeVariant(variantId, masterId, phash) {
+    const variant = m.get(String(variantId));
+    const master = m.get(String(masterId));
+    if (!variant || !master || variant.id === master.id) return null;
+    const now = Math.round(Date.now());
+    const mergedVariant = m.put({
+      ...variant,
+      status: master.status === 'ready' ? 'ready' : variant.status,
+      desc: master.desc || variant.desc,
+      tags: master.tags.length ? [...master.tags] : variant.tags,
+      phash: phash || variant.phash,
+      mergedInto: master.id,
+      updatedAt: now,
+    });
+    const updatedMaster = m.put({
+      ...master,
+      useCount: (master.useCount ?? 0) + 1,
+      lastUsedAt: now,
+    });
+    return { variant: mergedVariant, master: updatedMaster };
+  }
+
+  /** buffer → pHash（查询场景无落盘：临时目录写盘解码后即删）。失败返回 null。 */
+  function phashOfBase64(imageBase64) {
+    let dir = null;
+    try {
+      dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sticker-phash-'));
+      const file = path.join(dir, 'query.img');
+      fs.writeFileSync(file, Buffer.from(String(imageBase64), 'base64'));
+      return phashFromFile(file);
+    } catch {
+      return null;
+    } finally {
+      try { if (dir) fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 忽略清理失败 */ }
+    }
+  }
+
+  /**
+   * 表情三级检索（chat_sticker_find 与 /api/sticker/find 共用）：
+   *   1. 带图 → pHash：距离 ≤6 命中（perceptual）；7~12 给候选（perceptual-candidate，低置信）
+   *   2. 文本 → FTS/LIKE 语义（semantic，仅 is_sticker=1）
+   *   3. 兜底 → 常用表情（popular，use_count 降序——「长期使用」的表情排前面）
+   */
+  function stickerFind({ text, imageBase64, limit = 5 } = {}) {
+    const cap = Math.max(1, Math.min(20, Math.round(Number(limit)) || 5));
+    if (imageBase64) {
+      const ph = phashOfBase64(imageBase64);
+      if (ph?.hash) {
+        const exact = findNearPhash(ph.hash, PHASH_CONFIRM_DISTANCE);
+        if (exact) {
+          return [{ ...exact.asset, matchType: 'perceptual', distance: exact.distance }];
+        }
+        const candidate = findNearPhash(ph.hash, PHASH_CANDIDATE_DISTANCE);
+        if (candidate) {
+          return [{ ...candidate.asset, matchType: 'perceptual-candidate', distance: candidate.distance }];
+        }
+      }
+    }
+    const queryText = String(text ?? '').trim();
+    if (queryText) {
+      const { rows } = m.query({ text: queryText, kind: 'image', stickerOnly: true, limit: cap });
+      if (rows.length) return rows.map((r) => ({ ...r, matchType: 'semantic', distance: null }));
+    }
+    const { rows } = m.query({ kind: 'image', stickerOnly: true, limit: cap });
+    return rows.map((r) => ({ ...r, matchType: 'popular', distance: null }));
+  }
+
+
   function findByRef(ref, { platform } = {}) {
     const key = String(ref ?? '');
     if (!key) return null;
@@ -367,6 +469,17 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
     const repaired = [];
     const out = String(text ?? '').replace(MEDIA_PLACEHOLDER_RE, (full, zh, id) => {
       const asset = m.get(id);
+      // 视频/文件不进详情表（2026-11-25）：未登记的占位符渲染为最小文字，
+      // 不触发清退修复（它们不是被清退，而是从未入库）。
+      if (!asset && (zh === '视频' || zh === '文件')) {
+        return `[${zh}|未入库]`;
+      }
+      // 语音不保留源文件（2026-11-25）：详情记录（转写文本）长期保留——渲染不依赖
+      // 源文件存在性，避免 inbox 暂存清理后误删记录（语音瘦身语义）。
+      if (asset && asset.kind === 'voice' && (asset.desc || asset.textContent)) {
+        const body = String(asset.desc || asset.textContent || '语音消息').slice(0, 120);
+        return `[${zh}|${id}|${body}]`;
+      }
       if (asset && asset.sourcePath && fs.existsSync(asset.sourcePath)) {
         const body = String(asset.desc || asset.textContent || minimalDesc(asset) || '媒体内容').slice(0, 120);
         return `[${zh}|${id}|${body}]`;
@@ -379,6 +492,28 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
       return retiredZh;
     });
     return { text: out, repaired };
+  }
+
+  /**
+   * 语音资产瘦身（2026-11-25）：把源文件挪出 media 目录（voice inbox 暂存）并同步
+   * sourcePath——详情记录保留，源文件离开收藏池管理域（超龄由 voice-bank 清理）。
+   * 失败返回 null（调用方降级：文件留着等 mediaRetention 清退）。
+   */
+  function relocateSource(id, toPath) {
+    const row = m.get(String(id));
+    if (!row?.sourcePath) return null;
+    try {
+      fs.mkdirSync(path.dirname(toPath), { recursive: true });
+      try {
+        fs.renameSync(row.sourcePath, toPath);
+      } catch {
+        fs.copyFileSync(row.sourcePath, toPath); // 跨卷兜底：复制+删源
+        fs.rmSync(row.sourcePath, { force: true });
+      }
+      return m.put({ ...row, sourcePath: toPath });
+    } catch {
+      return null;
+    }
   }
 
   function headRows({ limit } = {}) {
@@ -403,6 +538,8 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
     upsertCognition,
     updateDesc,
     markUsed,
+    /** 源文件迁出收藏池（语音瘦身用）：挪文件 + 更新 sourcePath */
+    relocateSource,
     get,
     search,
     /** 收藏池选图（v3.1）：语义×热度×随机的定量列表（gateway-v1 chat_media_search 用）。 */
@@ -414,6 +551,10 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
     scanPending,
     findByHash,
     findByRef,
+    /** 表情库（2026-11-26）：pHash 近邻 / 变体归并 / 三级检索 */
+    findNearPhash,
+    mergeVariant,
+    stickerFind,
     collectFromTexts,
     minimalDesc,
     rewriteForSummary,
