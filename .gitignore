@@ -27,3 +27,7 @@ vision.config.json
 
 # 环境变量载体（可含密钥，模板见 .env.example）
 .env
+
+# 子服务运行时输出（stdout/stderr 重定向）
+subprocesses/*/run.out
+subprocesses/*/run.err
