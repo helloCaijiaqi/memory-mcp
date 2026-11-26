@@ -39,19 +39,20 @@ export function createMediaCollection({ db, usable, writable, prepare }) {
     const createdAt = existing?.createdAt ?? r.createdAt;
     prepare(
       'medPut',
-      `INSERT INTO media_asset (id, session_id, platform, kind, source_path, hash, origin, ref,
+      `INSERT INTO media_asset (id, session_id, platform, kind, source_path, hash, origin,
          send_hints, desc, tags, text_content, duration_ms, status, use_count, last_used_at,
-         phash, merged_into, is_sticker, created_at, updated_at)
+         phash, merged_into, is_sticker, favorited, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          session_id = excluded.session_id, platform = excluded.platform,
          kind = excluded.kind, source_path = excluded.source_path, hash = excluded.hash,
-         origin = excluded.origin, ref = excluded.ref, send_hints = excluded.send_hints,
+         origin = excluded.origin, send_hints = excluded.send_hints,
          desc = excluded.desc, tags = excluded.tags, text_content = excluded.text_content,
          duration_ms = excluded.duration_ms, status = excluded.status,
          use_count = excluded.use_count, last_used_at = excluded.last_used_at,
          phash = excluded.phash, merged_into = excluded.merged_into,
-         is_sticker = excluded.is_sticker, updated_at = excluded.updated_at
+         is_sticker = excluded.is_sticker, favorited = excluded.favorited,
+         updated_at = excluded.updated_at
        `,
     ).run(
       r.id,
@@ -61,7 +62,6 @@ export function createMediaCollection({ db, usable, writable, prepare }) {
       r.sourcePath,
       r.hash,
       r.origin,
-      r.ref,
       JSON.stringify(r.sendHints),
       r.desc,
       JSON.stringify(r.tags),
@@ -73,6 +73,7 @@ export function createMediaCollection({ db, usable, writable, prepare }) {
       r.phash,
       r.mergedInto,
       r.isSticker ? 1 : 0,
+      r.favorited ? 1 : 0,
       createdAt,
       r.updatedAt,
     );
@@ -132,8 +133,9 @@ export function createMediaCollection({ db, usable, writable, prepare }) {
     }
 
     if (text) {
-      where.push("(m.desc LIKE ? ESCAPE '\\' OR m.tags LIKE ? ESCAPE '\\' OR m.ref LIKE ? ESCAPE '\\')");
-      params.push(likePattern(text), likePattern(text), likePattern(text));
+      // ref 列已退役（v8，路径唯一真值=source_path）：LIKE 检索只留 desc/tags。
+      where.push("(m.desc LIKE ? ESCAPE '\\' OR m.tags LIKE ? ESCAPE '\\')");
+      params.push(likePattern(text), likePattern(text));
     }
     // 稳定序供 head 渲染（渲染 head 必须换稳定键，与 slang 同纪律）。
     const orderSql =

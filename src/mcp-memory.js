@@ -264,22 +264,29 @@ export function createMcpMemoryServer({ memory, slang, relation, raw, recall, me
     );
     server.tool(
       'media_describe',
-      '主动解析图片内容：vision 模型看图返回描述并回写详情表（ready 直接返回缓存描述）。收藏语义重设计后无需收藏动作——进入详情表且被解析的媒体即被记住。',
+      '主动解析图片内容：vision 看图返回描述并回写详情表（ready 直接返回缓存描述）。可选 source 强制仅用某个识图源（失败不降级）、refresh 忽略缓存强制重识——是否需要由模型根据对话语义自主判断（换源/重识结果覆盖旧描述）。',
       {
         mediaId: z.string().describe('占位符 id（ma_ 开头 12 位十六进制）'),
+        source: z.enum(['saucenao', 'cloudflare', 'huggingFace']).optional().describe('强制仅用该识图源（跳过缓存与降级链，失败不降级）'),
+        refresh: z.boolean().optional().describe('true=忽略缓存强制重新识别'),
       },
       async (args) => {
         if (!mediaAnalyzer) return err('解析服务未装配');
         const asset = media.get(String(args.mediaId ?? ''));
         if (!asset) return err(`媒体资产不存在：${args.mediaId}`);
         if (asset.kind !== 'image') return err('当前仅支持图片解析');
-        if (asset.status === 'ready' && (asset.desc || asset.textContent)) {
+        const source = args.source ? String(args.source) : '';
+        const refresh = args.refresh === true;
+        if (!source && !refresh && asset.status === 'ready' && (asset.desc || asset.textContent)) {
           return ok({ mediaId: asset.id, desc: asset.desc || asset.textContent, tags: asset.tags, cached: true });
         }
-        const r = await mediaAnalyzer.analyzeOne(asset);
-        if (!r?.ok) return err(`暂无法解析（${r?.reason ?? 'vision-failed'}），已转入后台队列重试`);
+        const r = await mediaAnalyzer.analyzeOne(asset, source ? { visionSource: source } : {});
+        if (!r?.ok) {
+          const note = source ? `指定源 ${source} 识别失败（不降级其它源），可换 source 重试` : `暂无法解析（${r?.reason ?? 'vision-failed'}），已转入后台队列重试`;
+          return err(note);
+        }
         const fresh = media.get(asset.id);
-        return ok({ mediaId: asset.id, desc: fresh?.desc, tags: fresh?.tags });
+        return ok({ mediaId: asset.id, desc: fresh?.desc, tags: fresh?.tags, ...(source || refresh ? { refreshed: true } : {}) });
       },
     );
   }

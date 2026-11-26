@@ -1,7 +1,9 @@
 // test-vision-svc：外部识图聚合子服务测试。
-// mock 四个外部识图源（真 HTTP server）+ 直接调 createVisionServer 工厂（端口 0 随机），
-// 覆盖：健康检查 / 动漫双轨命中与缓存 / 未命中走 Cloudflare / 全败降级 / 配额跳过 /
-//       坏缓存自愈 / Bearer 鉴权 / 空图入参。
+// mock 三个外部识图源（真 HTTP server）+ 直接调 createVisionServer 工厂（端口 0 随机），
+// 覆盖：健康检查 / saucenao 动漫命中与缓存 / 未命中走 Cloudflare / 全败降级 / 配额跳过 /
+//       坏缓存自愈 / Bearer 鉴权 / 空图入参 / 强制单源 source / refresh 跳缓存 /
+//       换源覆盖缓存 / GET /sources。
+// trace.moe 已剔除（2026-11-26 用户裁定：日语作品数据库，不符中文识图场景）。
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { after } from 'node:test';
@@ -17,7 +19,7 @@ const CACHE_DIR = path.join(TMP, 'cache');
 const CONFIG_PATH = path.join(TMP, 'vision.config.json');
 
 // ---------- mock 外部识图源（mode 可切换：hit / low / fail） ----------
-const mockCalls = { saucenao: 0, trace: 0, cf: 0, hf: 0 };
+const mockCalls = { saucenao: 0, cf: 0, hf: 0 };
 let mockMode = 'hit';
 const mockServer = http.createServer((req, res) => {
   const chunks = [];
@@ -31,13 +33,6 @@ const mockServer = http.createServer((req, res) => {
       if (mockMode === 'fail') return reply(500, { error: 'boom' });
       return reply(200, {
         results: [{ header: { similarity: mockMode === 'low' ? 30 : 91.5 }, data: { title: '葬送的芙莉莲', characters: ['芙莉莲', '费伦'], member_name: '山田钟人' } }],
-      });
-    }
-    if (p === '/trace') {
-      mockCalls.trace += 1;
-      if (mockMode === 'fail') return reply(500, { error: 'boom' });
-      return reply(200, {
-        result: [{ similarity: mockMode === 'low' ? 0.3 : 0.84, episode: 3, anilist: { title: { native: '葬送的芙莉莲' }, characters: [{ name: { full: '费伦' } }] } }],
       });
     }
     if (p === '/cf') {
@@ -59,11 +54,10 @@ const mockPort = await new Promise((resolve, reject) => {
 });
 const mockUrl = (p) => `http://127.0.0.1:${mockPort}${p}`;
 
-function writeConfig() {
+function writeConfig({ cfUrl } = {}) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify({
     sauceNao: { apiKey: 'sk-sauce', searchUrl: mockUrl('/saucenao'), dailyQuota: 100 },
-    traceMoe: { apiKey: 'tm-key', searchUrl: mockUrl('/trace'), dailyQuota: 120 },
-    cloudflare: { accountId: 'acct', apiToken: 'cf-tok', runUrl: mockUrl('/cf'), dailyQuota: 2000 },
+    cloudflare: { accountId: 'acct', apiToken: 'cf-tok', runUrl: cfUrl ?? mockUrl('/cf'), dailyQuota: 2000 },
     huggingFace: { token: 'hf-tok', runUrl: mockUrl('/hf'), dailyQuota: 50 },
   }));
 }
@@ -103,7 +97,7 @@ test('health：聚合服务在线，key 探针全亮，pid 供 supervisor 校验
     assert.equal(h.ok, true);
     assert.equal(h.engine, 'vision-agg');
     assert.equal(typeof h.pid, 'number');
-    assert.deepEqual(h.keys, { saucenao: true, traceMoe: true, cloudflare: true, huggingFace: true });
+    assert.deepEqual(h.keys, { saucenao: true, cloudflare: true, huggingFace: true });
   });
 
   test('空图入参：ok:false empty-image', async () => {
@@ -112,7 +106,7 @@ test('health：聚合服务在线，key 探针全亮，pid 供 supervisor 校验
     assert.equal(out.reason, 'empty-image');
   });
 
-  test('动漫双轨命中：SauceNAO 91.5% > trace.moe 84%，取高分合成元数据', async () => {
+  test('动漫命中：SauceNAO 91.5% >=80% 判命中', async () => {
     await resetMockCalls();
     mockMode = 'hit';
     const img = imageBytes('anime-hit');
@@ -122,11 +116,9 @@ test('health：聚合服务在线，key 探针全亮，pid 供 supervisor 校验
     assert.equal(out.cached, false);
     assert.ok(out.desc.includes('芙莉莲'));
     assert.ok(out.desc.includes('91.5'));
-    assert.deepEqual(mockCalls, { saucenao: 1, trace: 1, cf: 0, hf: 0 });
-    // 双轨都烧了配额
+    assert.deepEqual(mockCalls, { saucenao: 1, cf: 0, hf: 0 });
     const usage = JSON.parse(fs.readFileSync(todayUsageFile(), 'utf8'));
     assert.equal(usage.saucenao, 1);
-    assert.equal(usage.traceMoe, 1);
   });
 
   test('缓存命中：同图第二次识别零外部调用', async () => {
@@ -136,10 +128,10 @@ test('health：聚合服务在线，key 探针全亮，pid 供 supervisor 校验
     const out = await svc.recognize(img.base64);
     assert.equal(out.ok, true);
     assert.equal(out.cached, true);
-    assert.deepEqual(mockCalls, { saucenao: 0, trace: 0, cf: 0, hf: 0 });
+    assert.deepEqual(mockCalls, { saucenao: 0, cf: 0, hf: 0 });
   });
 
-  test('双轨未命中（<80%）走 Cloudflare 照片域', async () => {
+  test('未命中（<80%）走 Cloudflare 照片域', async () => {
     await resetMockCalls();
     mockMode = 'low';
     const img = imageBytes('photo-cat');
@@ -147,7 +139,7 @@ test('health：聚合服务在线，key 探针全亮，pid 供 supervisor 校验
     assert.equal(out.ok, true);
     assert.equal(out.source, 'cloudflare');
     assert.equal(out.desc, '一只橘猫趴在窗台上晒太阳');
-    assert.deepEqual(mockCalls, { saucenao: 1, trace: 1, cf: 1, hf: 0 });
+    assert.deepEqual(mockCalls, { saucenao: 1, cf: 1, hf: 0 });
   });
 
   test('CF 也未命中降级 HF', async () => {
@@ -156,7 +148,6 @@ test('health：聚合服务在线，key 探针全亮，pid 供 supervisor 校验
     // CF 临时改走失败路径：直接把 runUrl 指到 404
     fs.writeFileSync(CONFIG_PATH, JSON.stringify({
       sauceNao: { apiKey: 'sk-sauce', searchUrl: mockUrl('/saucenao'), dailyQuota: 100 },
-      traceMoe: { apiKey: 'tm-key', searchUrl: mockUrl('/trace'), dailyQuota: 120 },
       cloudflare: { accountId: 'acct', apiToken: 'cf-tok', runUrl: mockUrl('/cf-fail-404'), dailyQuota: 2000 },
       huggingFace: { token: 'hf-tok', runUrl: mockUrl('/hf'), dailyQuota: 50 },
     }));
@@ -175,10 +166,10 @@ test('health：聚合服务在线，key 探针全亮，pid 供 supervisor 校验
     const out = await svc.recognize(img.base64);
     assert.equal(out.ok, false);
     assert.equal(out.reason, 'no-hit');
-    assert.deepEqual(mockCalls, { saucenao: 1, trace: 1, cf: 1, hf: 1 });
+    assert.deepEqual(mockCalls, { saucenao: 1, cf: 1, hf: 1 });
   });
 
-  test('配额超限：四源全部跳过，零外部请求', async () => {
+  test('配额超限：三源全部跳过，零外部请求', async () => {
     await resetMockCalls();
     // 与服务端 todayStamp() 同口径：本地日期（UTC toISOString 在东八区 0-8 点会差一天）
     const d = new Date();
@@ -186,14 +177,14 @@ test('health：聚合服务在线，key 探针全亮，pid 供 supervisor 校验
     const localStamp = Number(`${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}`);
     fs.writeFileSync(todayUsageFile(), JSON.stringify({
       date: localStamp,
-      saucenao: 100, traceMoe: 120, cloudflare: 2000, huggingFace: 50,
+      saucenao: 100, cloudflare: 2000, huggingFace: 50,
     }));
     mockMode = 'hit';
     const img = imageBytes('quota-exhausted');
     const out = await svc.recognize(img.base64);
     assert.equal(out.ok, false);
     assert.equal(out.reason, 'no-hit');
-    assert.deepEqual(mockCalls, { saucenao: 0, trace: 0, cf: 0, hf: 0 });
+    assert.deepEqual(mockCalls, { saucenao: 0, cf: 0, hf: 0 });
     fs.rmSync(todayUsageFile(), { force: true }); // 还原配额
   });
 
@@ -207,6 +198,87 @@ test('health：聚合服务在线，key 探针全亮，pid 供 supervisor 校验
     assert.equal(out.ok, true);
     assert.equal(out.source, 'saucenao');
     assert.equal(out.cached, false);
+  });
+
+  // ---------- 换源重识（2026-11-26）：source 强制单源 / refresh 跳缓存 / 覆盖缓存 ----------
+
+  test('source 强制单源：动漫图走 cloudflare 也能识（跳过 saucenao 与缓存）', async () => {
+    await resetMockCalls();
+    mockMode = 'low'; // saucenao 会返回低相似度（走不到动漫命中），但 source=cloudflare 时根本不该调它
+    const img = imageBytes('forced-cf');
+    const out = await svc.recognize(img.base64, 'image/png', { source: 'cloudflare' });
+    assert.equal(out.ok, true);
+    assert.equal(out.source, 'cloudflare');
+    assert.equal(out.cached, false);
+    assert.deepEqual(mockCalls, { saucenao: 0, cf: 1, hf: 0 }, '指定源不得烧其它源配额');
+  });
+
+  test('source 强制单源：失败返回 source-failed，不降级其它源', async () => {
+    await resetMockCalls();
+    mockMode = 'fail';
+    const img = imageBytes('forced-cf-fail');
+    const out = await svc.recognize(img.base64, 'image/png', { source: 'cloudflare' });
+    assert.equal(out.ok, false);
+    assert.equal(out.reason, 'source-failed');
+    assert.equal(out.source, 'cloudflare');
+    assert.deepEqual(mockCalls, { saucenao: 0, cf: 1, hf: 0 }, '失败不降级 huggingFace');
+  });
+
+  test('source 未知源：ok:false unknown-source', async () => {
+    const img = imageBytes('unknown-source');
+    const out = await svc.recognize(img.base64, 'image/png', { source: 'traceMoe' });
+    assert.equal(out.ok, false);
+    assert.equal(out.reason, 'unknown-source:traceMoe');
+  });
+
+  test('source 重识覆盖缓存：后续普通识别拿到新源结果', async () => {
+    mockMode = 'low';
+    const img = imageBytes('cache-overwrite');
+    // 第一次：默认链（saucenao low → cloudflare）
+    const first = await svc.recognize(img.base64);
+    assert.equal(first.source, 'cloudflare');
+    // 换源强制重识：huggingFace 结果覆盖同 hash 缓存
+    mockMode = 'fail'; // cf/hf 用 mode fail？hf fail 会失败——改回 low 后强制 huggingFace
+    mockMode = 'low';
+    const second = await svc.recognize(img.base64, 'image/png', { source: 'huggingFace' });
+    assert.equal(second.ok, true);
+    assert.equal(second.source, 'huggingFace');
+    assert.equal(second.desc, 'a cat sitting by the window');
+    // 普通识别：缓存命中且 source 已变为 huggingFace（旧 cloudflare 结果被覆盖）
+    await resetMockCalls();
+    const third = await svc.recognize(img.base64);
+    assert.equal(third.ok, true);
+    assert.equal(third.cached, true);
+    assert.equal(third.source, 'huggingFace', '换源重识应覆盖旧缓存');
+    assert.deepEqual(mockCalls, { saucenao: 0, cf: 0, hf: 0 });
+  });
+
+  test('refresh 跳缓存全链重跑：缓存命中图重新烧请求并覆盖结果', async () => {
+    mockMode = 'hit';
+    const img = imageBytes('refresh-run');
+    await svc.recognize(img.base64); // 先建立缓存
+    await resetMockCalls();
+    const out = await svc.recognize(img.base64, 'image/png', { refresh: true });
+    assert.equal(out.ok, true);
+    assert.equal(out.cached, false);
+    assert.deepEqual(mockCalls, { saucenao: 1, cf: 0, hf: 0 }, 'refresh 应跳过缓存重跑');
+  });
+
+  test('GET /sources：各源就绪与配额余量；带 token 鉴权', async () => {
+    const res = await fetch(`${base}/sources`);
+    assert.equal(res.status, 200);
+    const j = await res.json();
+    assert.equal(j.ok, true);
+    assert.deepEqual(j.sources.map((s) => s.name), ['saucenao', 'cloudflare', 'huggingFace']);
+    for (const s of j.sources) {
+      assert.equal(typeof s.ready, 'boolean');
+      assert.equal(typeof s.quotaRemaining, 'number');
+    }
+    const authBase = `http://127.0.0.1:${authSvc.server.address().port}`;
+    const denied = await fetch(`${authBase}/sources`);
+    assert.equal(denied.status, 401);
+    const allowed = await fetch(`${authBase}/sources`, { headers: { authorization: 'Bearer secret-token' } });
+    assert.equal(allowed.status, 200);
   });
 
   test('HTTP 面：Bearer 鉴权 401 / 缺参 400 / 正常 200', async () => {

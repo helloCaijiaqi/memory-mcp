@@ -66,12 +66,16 @@ export function sanitizeDescInput(rawDesc) {
   return { desc: text, tags: [] };
 }
 
-export function createMediaService({ store, config = {}, repairPlaceholder = null } = {}) {
+export function createMediaService({ store, config = {}, repairPlaceholder = null, logger = () => {} } = {}) {
   if (!store) throw new Error('createMediaService 需要 store');
   const cfg = { ...DEFAULT_MEDIA_CONFIG, ...config };
   // repairPlaceholder（媒体管道 v2）：召回时发现源文件缺失 → 删记录 + 修复摘要/raw
   // 的一致性回调（server.mjs 注入 media-retention 的 repairPlaceholderBatch）。
   const retiredText = config.retiredText ?? '[媒体：内容已清退]';
+  // 热门图片自动收藏阈值（2026-11-26 清退语义重设计）：发送频率即分数——use_count
+  // 达阈值自动收藏（favorited=1 豁免清退）。仅图片；语音/视频/文件的学习信号只作排序。
+  const autoFavoriteThreshold = Math.max(1, Number(config.autoFavoriteCount
+    ?? process.env.MEMORY_MCP_MEDIA_AUTO_FAVORITE_COUNT ?? 3) || 3);
   const m = store.media;
 
   // ---------- 占位符 ----------
@@ -94,10 +98,12 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
       if (item.fileRef && fs.existsSync(item.fileRef)) {
         // 白名单（媒体管道 v2）：fileRef 必须在 mediaDir 内（bridge 落盘共享目录即
         // mediaDir 的 qq/ 子目录）——单份存储直接引用，不复制；白名单外一律拒绝，
-        // 防任意路径读。
+        // 防任意路径读。比较大小写不敏感（2026-11-26）：path.resolve 不归一化盘符
+        // 大小写，bridge 小写 c:\ 与本进程大写 C:\ 会让 startsWith 误拒。
         const resolved = path.resolve(item.fileRef);
         const root = path.resolve(cfg.mediaDir);
-        if (!resolved.startsWith(root)) return null;
+        const norm = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+        if (!norm(resolved).startsWith(norm(root))) return null;
         const stat = fs.statSync(resolved);
         if (!stat.isFile() || stat.size > cfg.maxFileBytes) return null;
         const direct = fs.readFileSync(resolved);
@@ -161,14 +167,19 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
       const existing = m.get(id);
       if (existing) {
         const patch = {};
-        if (!existing.ref && (item.ref || item.url)) patch.ref = String(item.ref ?? item.url);
+        // ref 退役（v8）：入站定位符（ref/url）回放补丁并入 source_path。
+        if (!existing.sourcePath && (item.ref || item.url)) {
+          patch.sourcePath = String(item.sourcePath ?? item.ref ?? item.url);
+        }
         if (!existing.hash && item.hash) patch.hash = String(item.hash);
         if (existing.durationMs == null && item.durationMs != null) patch.durationMs = item.durationMs;
         rows.push(Object.keys(patch).length ? m.put({ ...existing, ...patch }) : existing);
         continue;
       }
       let hash = String(item.hash ?? '');
-      let sourcePath = '';
+      // source_path 是唯一源定位符（v8 ref 退役）：优先落盘抓取结果，其次
+      // 入站自带的本地路径（sourcePath/fileRef）或远程 URL（ref/url）。
+      let sourcePath = String(item.sourcePath ?? item.ref ?? item.url ?? item.fileRef ?? '').trim();
       if (!hash && (item.url || item.fileRef)) {
         const fetched = await fetchToStore(item);
         if (fetched) { hash = fetched.hash; sourcePath = fetched.sourcePath; }
@@ -192,7 +203,6 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
         sessionId,
         kind: MEDIA_KINDS.includes(item.kind) ? item.kind : 'image',
         origin: item.origin ?? 'inbound',
-        ref: String(item.ref ?? item.url ?? item.fileRef ?? ''),
         sourcePath,
         hash,
         desc,
@@ -235,11 +245,42 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
   // markFavorite 已退役（媒体管道 v3 收藏语义重设计）：进入详情表且被解析
   // （status='ready'）即被记住 = 收藏含义，无需标记动作；favorited 列保留弃用。
 
-  /** 发送学习信号：use_count+1（【多媒体】注入排序依据）。 */
+  /** 语音合成占位（2026-11-26）：pending → synthesizing。analyzer 兜底队列只扫
+   *  pending，合成未完成的空语音资产不标 synthesizing 会被 60s 轮 no-audio-data
+   *  误杀（实测 ma_ce8080da1d1a）。仅供 voice-synth 内部调用，updateDesc 的白名单
+   *  （ready/failed）不放开。 */
+  function markSynthesizing(id) {
+    const existing = m.get(String(id));
+    if (!existing) return null;
+    return m.put({ ...existing, status: 'synthesizing' });
+  }
+
+  /** 收藏/取消收藏（v7 迁移回归，2026-11-26 清退语义重设计）：favorited 是清退豁免的
+   *  唯一依据——豁免 retention 定时清退与 inbox/out prune 清扫；懒清退（源文件真缺失）
+   *  不受豁免。幂等：重复收藏/取消返回同一结果。入口：chat_media_favorite 工具 +
+   *  markUsed 热门图片自动收藏。 */
+  function setFavorite(id, favorite = true) {
+    const existing = m.get(String(id));
+    if (!existing) return null;
+    return m.put({ ...existing, favorited: Boolean(favorite) });
+  }
+
+  /** 发送学习信号：use_count+1（【多媒体】注入排序依据）。
+   *  热门图片自动收藏（2026-11-26）：kind==='image' 且未收藏且 use_count 达阈值
+   *  → 自动 setFavorite（豁免清退）。判定在落库后（拿新 use_count），幂等——已收藏
+   *  资产不再重复写；语音/视频/文件不参与（学习信号只作排序热度）。 */
   function markUsed(id, { at = Date.now() } = {}) {
     const existing = m.get(String(id));
     if (!existing) return null;
-    return m.put({ ...existing, useCount: (existing.useCount ?? 0) + 1, lastUsedAt: Math.round(at) });
+    const updated = m.put({ ...existing, useCount: (existing.useCount ?? 0) + 1, lastUsedAt: Math.round(at) });
+    if (existing.kind === 'image' && !existing.favorited
+      && (updated?.useCount ?? 0) >= autoFavoriteThreshold) {
+      try {
+        const favorited = setFavorite(id, true);
+        if (favorited) logger(`[media-service] 热门图片自动收藏 ${id}（use_count=${updated.useCount}）`);
+      } catch { /* 收藏失败不影响学习信号 */ }
+    }
+    return updated;
   }
 
   /**
@@ -264,7 +305,8 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
     return m.put({
       ...base,
       kind: MEDIA_KINDS.includes(item.kind) ? item.kind : (base.kind ?? 'image'),
-      ref: String(item.ref ?? base.ref ?? ''),
+      // ref 退役（v8）：登记时的定位符并入 source_path（老语音库/URL 兼容回退保留）。
+      sourcePath: String(item.sourcePath ?? item.ref ?? base.sourcePath ?? ''),
       sendHints: item.sendHints && typeof item.sendHints === 'object' ? { ...base.sendHints, ...item.sendHints } : (base.sendHints ?? {}),
       desc,
       tags: Array.isArray(item.tags) && item.tags.length ? item.tags.map((t) => String(t).trim()).filter(Boolean).slice(0, 20) : (base.tags ?? []),
@@ -400,12 +442,7 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
   }
 
 
-  function findByRef(ref, { platform } = {}) {
-    const key = String(ref ?? '');
-    if (!key) return null;
-    const { rows } = m.query({ text: key, limit: 50 });
-    return rows.find((r) => r.ref === key && (!platform || r.platform === platform)) ?? null;
-  }
+  // findByRef 已随 ref 列退役删除（v8，2026-11-26）：无调用方，路径检索走 source_path。
 
   // ---------- 摘要完整性（占位符 → 解释文字） ----------
   /**
@@ -458,15 +495,26 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
 
   // ---------- head 渲染（一行一资产：query 按 id 返回，注入层天然去重） ----------
   /**
-   * 召回占位符验证替换（媒体管道 v3，2026-11-24）：所有流出 DSH 的文本统一过这里。
-   * 占位符 → 查详情表 + 验证源文件存在：
-   *   存在  → 替换为 [图片|<id>|<描述>]（类型保持 + id + 内容描述，DSH 可读）；
-   *   缺失  → 删详情记录 + 占位符换 [图片|内容已清退] + repairPlaceholder 修复摘要/raw
-   *           （三层数据状态一致）。
+   * 召回占位符验证替换（媒体管道 v3，2026-11-24；2026-11-26 统一清退语义重设计）：
+   * 所有流出 DSH 的文本统一过这里。占位符 → 查详情表 + 验证源文件存在：
+   *   文件在        → 替换为 [类型|<id>|<描述>]（类型保持 + id + 内容描述，DSH 可读）；
+   *   合成中/待解析 → 占位符原样保留（sourcePath 为空属正常中间态，绝不懒清退）；
+   *   文件真缺失    → 统一懒清退：删详情行 + 占位符固化为 [类型|内容已清退|<描述>]
+   *                 （描述封存进 raw，记忆不随详情行死亡）+ repairPlaceholder 修复
+   *                 摘要/raw（三层数据状态一致）。
+   *   懒清退【不检查收藏】——收藏只豁免「主动删文件」路径（retention/prune），文件
+   *   真消失时谁也保不住（favorited 为 true 也没有用）。
    * 返回 { text, repaired }（repaired = 触发修复的 id，供观测）。
    */
   function renderPlaceholders(text, { retiredText: overrideRetired } = {}) {
     const repaired = [];
+    const retireOf = (zh, asset) => {
+      // 清退核心词：config.retiredText / overrideRetired 显式配置保留 override 语义
+      // （取其末尾中文短语）；描述封存：desc/textContent 截断 120 固化进占位符。
+      const core = (overrideRetired ?? retiredText).match(/[\u4e00-\u9fa5]+(?=])$/)?.[0] ?? '内容已清退';
+      const body = String(asset?.desc || asset?.textContent || '').trim().slice(0, 120);
+      return body ? `[${zh}|${core}|${body}]` : `[${zh}|${core}]`;
+    };
     const out = String(text ?? '').replace(MEDIA_PLACEHOLDER_RE, (full, zh, id) => {
       const asset = m.get(id);
       // 视频/文件不进详情表（2026-11-25）：未登记的占位符渲染为最小文字，
@@ -474,19 +522,22 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
       if (!asset && (zh === '视频' || zh === '文件')) {
         return `[${zh}|未入库]`;
       }
-      // 语音不保留源文件（2026-11-25）：详情记录（转写文本）长期保留——渲染不依赖
-      // 源文件存在性，避免 inbox 暂存清理后误删记录（语音瘦身语义）。
-      if (asset && asset.kind === 'voice' && (asset.desc || asset.textContent)) {
-        const body = String(asset.desc || asset.textContent || '语音消息').slice(0, 120);
-        return `[${zh}|${id}|${body}]`;
+      // 合成中（2026-11-26 硬约束）：voice-synth 合成 25-90s > analyzer 60s 轮，
+      // synthesizing 的 sourcePath 为空属正常中间态，占位符原样保留。
+      // pending 不在此列：提交即标 synthesizing（竞态修复），残留 pending+无文件的
+      // 是孤儿行，懒清退兜底清理（转写从未发生，无记忆可保）。
+      if (asset && asset.status === 'synthesizing') {
+        return full;
       }
+      // 源文件在 → 全类型统一渲染（含语音：转写后迁 inbox，3 天窗口内文件在）。
       if (asset && asset.sourcePath && fs.existsSync(asset.sourcePath)) {
         const body = String(asset.desc || asset.textContent || minimalDesc(asset) || '媒体内容').slice(0, 120);
         return `[${zh}|${id}|${body}]`;
       }
-      // 源文件缺失（清退/异常/兜底库）：删详情记录 + 缺省文字（类型保持）+ 一致性修复。
-      const retiredZh = overrideRetired ?? `[${zh}|${(retiredText.match(/[\u4e00-\u9fa5]+(?=])$/) ?? ['内容已清退'])[0]}]`;
-      try { m.remove(id); } catch {}
+      // 源文件缺失（清退/异常/手动删除）：统一懒清退（不看收藏）——删详情记录 +
+      // 描述封存进清退文本（类型保持）+ repairPlaceholder 一致性修复（raw/摘要）。
+      const retiredZh = retireOf(zh, asset);
+      try { if (asset) m.remove(id); } catch {}
       try { repairPlaceholder?.(id, retiredZh); } catch {}
       repaired.push(id);
       return retiredZh;
@@ -537,10 +588,15 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
     ensureAssets,
     upsertCognition,
     updateDesc,
+    markSynthesizing,
+    setFavorite,
     markUsed,
     /** 源文件迁出收藏池（语音瘦身用）：挪文件 + 更新 sourcePath */
     relocateSource,
     get,
+    /** 全字段 upsert（2026-11-26 暴露）：voice-synth 合成产物回写 ref/sourcePath、
+     *  清退管道等内部模块用；调用方自带完整行（get 后展开覆盖），不做部分补丁。 */
+    put: (row) => m.put(row),
     search,
     /** 收藏池选图（v3.1）：语义×热度×随机的定量列表（gateway-v1 chat_media_search 用）。 */
     selectForSend,
@@ -550,7 +606,6 @@ export function createMediaService({ store, config = {}, repairPlaceholder = nul
     remove: (id) => m.remove(String(id)),
     scanPending,
     findByHash,
-    findByRef,
     /** 表情库（2026-11-26）：pHash 近邻 / 变体归并 / 三级检索 */
     findNearPhash,
     mergeVariant,

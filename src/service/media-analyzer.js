@@ -20,6 +20,7 @@ export const DEFAULT_MEDIA_ANALYZER_CONFIG = {
   perItemTimeoutMs: 25000,
   syncTimeoutMs: 8000,    // 摘要完整性快解析的总超时（短超时，绝不长等）
   maxDescChars: 80,
+  voiceInboxDir: '',      // 语音源暂存根（state/data/audio/inbox）；空=转写后源文件留原处
 };
 
 const MIME_BY_EXT = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp' };
@@ -57,7 +58,7 @@ export function createMediaAnalyzer({ store, service, llm, config = {}, logger =
         const ext = path.extname(asset.sourcePath).slice(1).toLowerCase();
         return { base64: fs.readFileSync(asset.sourcePath).toString('base64'), mime: MIME_BY_EXT[ext] ?? 'image/png' };
       }
-      const url = asset.ref && /^https?:\/\//.test(asset.ref) ? asset.ref : '';
+      const url = asset.sourcePath && /^https?:\/\//.test(asset.sourcePath) ? asset.sourcePath : '';
       if (!url) return null;
       // URL 下载走 service 的落盘通道（顺带固化源文件，一举两得）
       const controller = new AbortController();
@@ -89,26 +90,39 @@ export function createMediaAnalyzer({ store, service, llm, config = {}, logger =
    *  本机语音库）；绝对路径 ref 直接拒绝（与 bridge resolveVoicePathForV2 同纪律，
    *  防越界读文件）。 */
   function loadAudio(asset) {
-    const ref = String(asset.ref ?? '').trim();
-    if (!ref || /^https?:\/\//.test(ref) || path.isAbsolute(ref)) return null;
+    // 比较大小写不敏感（2026-11-26）：path.resolve 不归一化盘符大小写，bridge 小写
+    // c:\ 与配置大写 C:\ 会让 startsWith 误拒（win32 磁盘本就不区分大小写）。
+    const norm = (p) => (process.platform === 'win32' ? p.toLowerCase() : p);
+    const inRoot = (child, root) =>
+      norm(path.resolve(child)).startsWith(norm(path.resolve(root)) + (process.platform === 'win32' ? '' : path.sep));
+    // sourcePath 是唯一源定位符（v8 ref 退役）：绝对路径白名单内直接读；
+    // 相对名视为语音库 libDir 内文件（join 后必须仍在 libDir 内，防逃逸）；
+    // URL 不支持（音频无远程读取通道，维持原行为）。
+    const sourcePath = String(asset.sourcePath ?? '').trim();
+    if (!sourcePath || /^https?:\/\//.test(sourcePath)) return null;
+    if (path.isAbsolute(sourcePath)) {
+      if (!fs.existsSync(sourcePath)) return null;
+      const ext0 = path.extname(sourcePath).slice(1).toLowerCase();
+      return readLocalBase64(sourcePath, AUDIO_MIME_BY_EXT[ext0] ?? 'audio/wav');
+    }
     const libDir = llm?.config?.audio?.libDir;
     if (!libDir) return null;
-    const ext = path.extname(ref).slice(1).toLowerCase();
-    const file = path.join(libDir, ref);
+    const ext = path.extname(sourcePath).slice(1).toLowerCase();
+    const file = path.join(libDir, sourcePath);
     // 防 libDir 外逃逸：join 后必须仍在 libDir 内
-    if (!path.resolve(file).startsWith(path.resolve(libDir))) return null;
+    if (!inRoot(file, libDir)) return null;
     return readLocalBase64(file, AUDIO_MIME_BY_EXT[ext] ?? 'audio/wav');
   }
 
-  /** video 资产取视频 base64：sourcePath 落盘优先（kind 子目录），否则 http ref 下载。 */
+  /** video 资产取视频 base64：sourcePath 落盘优先（kind 子目录），否则 http 下载。 */
   async function loadVideo(asset) {
-    const ext = path.extname(asset.sourcePath ?? asset.ref ?? '').slice(1).toLowerCase();
+    const ext = path.extname(asset.sourcePath ?? '').slice(1).toLowerCase();
     const mime = VIDEO_MIME_BY_EXT[ext] ?? 'video/mp4';
     try {
       if (asset.sourcePath && fs.existsSync(asset.sourcePath)) {
         return readLocalBase64(asset.sourcePath, mime);
       }
-      const url = asset.ref && /^https?:\/\//.test(asset.ref) ? asset.ref : '';
+      const url = asset.sourcePath && /^https?:\/\//.test(asset.sourcePath) ? asset.sourcePath : '';
       if (!url) return null;
       const controller = new AbortController();
       const timer2 = setTimeout(() => controller.abort(), cfg.perItemTimeoutMs);
@@ -129,15 +143,16 @@ export function createMediaAnalyzer({ store, service, llm, config = {}, logger =
    *   reason=vision/audio/video-disabled → 模型未配置，保持 pending（配置后自动补解析）；
    *   reason=no-xxx-data / xxx-failed / kind-unsupported → 调用方标 failed 不重试。
    */
-  async function analyzeOne(asset) {
+  async function analyzeOne(asset, { visionSource } = {}) {
     const kind = asset.kind;
     if (kind === 'image') {
       if (!llm?.visionEnabled) return { ok: false, reason: 'vision-disabled' };
       // 表情库 pHash 归并（2026-11-26）：先算感知哈希，近邻距离 ≤6 且主资产 ready →
       // 直接继承主资产描述（省识图配额：同款表情第二次出现不再调 vision-svc）。
       // 算不出哈希 / 未命中 → 正常走识图流程（哈希在回写时一并落库，供后续查询）。
+      // 指定 visionSource（换源强制重识）时跳过归并——继承旧描述会让换源失效。
       const ph = asset.sourcePath && fs.existsSync(asset.sourcePath) ? phashFromFile(asset.sourcePath) : null;
-      if (ph?.hash) {
+      if (!visionSource && ph?.hash) {
         const near = service.findNearPhash(ph.hash, PHASH_CONFIRM_DISTANCE);
         if (near && near.asset.status === 'ready' && !near.asset.mergedInto) {
           service.mergeVariant(asset.id, near.asset.id, ph.hash);
@@ -157,6 +172,7 @@ export function createMediaAnalyzer({ store, service, llm, config = {}, logger =
         imageBase64: img.base64,
         mime: img.mime,
         maxTokens: 200,
+        ...(visionSource ? { source: String(visionSource), refresh: true } : {}),
       });
       // adapter.vision 返回 {text, source}|null（兼容裸字符串=旧 LLM 直通形态）
       const text = typeof out === 'string' ? out : out?.text;
@@ -188,17 +204,22 @@ export function createMediaAnalyzer({ store, service, llm, config = {}, logger =
       const text = await llm.transcribe({
         audioBase64: audio.base64,
         mime: audio.mime,
-        filename: path.basename(String(asset.ref ?? 'audio.wav')),
+        filename: path.basename(String(asset.sourcePath ?? 'audio.wav')),
       });
       if (!text) return { ok: false, reason: 'audio-failed' };
       const desc = text.slice(0, cfg.maxDescChars);
       const row = service.updateDesc(asset.id, { desc, textContent: text, tags: ['语音', '转写'], status: 'ready' });
-      // 语音资产瘦身（2026-11-25）：详情记录只留转写文本；源文件挪出收藏池 →
-      // voice_lib/inbox 暂存（3 天内可归档为音色参考，超龄由 voice-bank 清理）。
-      const libDir = llm?.config?.audio?.libDir;
-      if (row?.status === 'ready' && libDir && typeof service.relocateSource === 'function') {
+      // 语音资产瘦身（2026-11-25；2026-11-26 三区合一更新）：详情记录只留转写文本；
+      // 源文件挪到语音运行时区（media/qq/audio，与合成产物/收媒体同目录共用）暂存
+      // ——分段命名 ma_<id>.in.<ext>，3 天归档窗口，超龄走 scanner 清退管道。
+      // 源文件已在该目录（bridge 直落共享区）时原地即暂存，跳过 move。
+      const voiceInboxDir = cfg.voiceInboxDir;
+      const voiceSrc = String(row?.sourcePath ?? asset.sourcePath ?? '');
+      const sameDir = voiceInboxDir && voiceSrc
+        && path.resolve(path.dirname(voiceSrc)) === path.resolve(voiceInboxDir);
+      if (row?.status === 'ready' && voiceInboxDir && !sameDir && typeof service.relocateSource === 'function') {
         try {
-          service.relocateSource(asset.id, path.join(libDir, 'inbox', `${asset.id}.wav`));
+          service.relocateSource(asset.id, path.join(voiceInboxDir, `${asset.id}.in.wav`));
         } catch { /* 迁移失败降级：源文件留原处等 retention 清退 */ }
       }
       return { ok: Boolean(row && row.status === 'ready'), reason: row ? undefined : 'update-failed' };

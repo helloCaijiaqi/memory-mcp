@@ -93,6 +93,8 @@ test('老库升级：memory 补齐新列、新表建起来，旧数据原样可�
     assert.deepEqual(legacy.sourceMsgIds, []);
     assert.equal(legacy.decayExempt, false);
     assert.equal(store.memory.query({ sessionId: SESSION, text: '旧记忆' }).rows.length, 1, '旧行的 FTS 索引仍可用');
+    // v7 迁移（2026-11-26）：media_asset 补 favorited 列（收藏=清退豁免唯一依据）
+    assert.ok(columnsOf(dbPath, 'media_asset').has('favorited'), 'v7 应补齐 media_asset.favorited');
   } finally {
     store.close();
   }

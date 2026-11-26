@@ -80,7 +80,7 @@
 1. 注册三个免费 key：**Cloudflare Workers AI**（1 万 neurons/天，免信用卡）、**SauceNAO**（动漫溯源）、**trace.moe**（帧溯源）。
 2. key 落 `vision.config.json`（gitignored 已有条目，模板见下）。
 3. 切 `MEMORY_MCP_MODEL_HUB_VISION_MODE=vision-svc` 并重启 memory 7181（孤儿 asr-svc 清理见 §6）。
-4. 识图三段流水线（LLM keep/skip 闸门 → 识图 → 落地）与「模型主动看图」`chat_media_describe` 经同一 analyzer 入口自动共享缓存与配额（零改动）。
+4. 识图三段流水线（LLM keep/skip 闸门 → 识图 → 落地）与「模型主动看图」`chat_image_describe`（原 `chat_media_describe`，2026-11-26 更名以名实相符：仅支持图片）经同一 analyzer 入口自动共享缓存与配额（零改动）。
 
 ```json
 // vision.config.json 模板（填好后生效）

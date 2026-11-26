@@ -5,7 +5,9 @@
 //   GET  /health     → { ok, sovitsUp, spawning }
 //   POST /synthesize → body { text, refPath, promptText, promptLang? } → { ok, wavBase64, elapsedMs } | { ok:false, error }
 // 鉴权：Bearer token（env MEMHUB_TOKEN）。
-// 内存水位保护：可用内存 < 15% 时拒绝合成（503 E_BUSY）——8GB 机器上 SoVITS 峰值 2.3GB。
+// 内存水位保护：可用内存 < 15% 时拒绝「冷启动拉起 SoVITS」（503 E_BUSY）——8GB 机器上
+// SoVITS 峰值 ~2.3GB；SoVITS 已存活时豁免（进程已在内存，拒绝合成回收不了任何内存，
+// 只会误伤；SoVITS 空闲 10 分钟自动退出后守卫恢复把关）。
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -163,10 +165,13 @@ const server = http.createServer(async (req, res) => {
   }
   if (url.pathname === '/synthesize' && req.method === 'POST') {
     if (!authorized(req)) return json(401, { ok: false, error: 'unauthorized' });
-    // 内存水位保护
-    const freeRatio = os.freemem() / os.totalmem();
-    if (freeRatio < ttsCfg.memFreeRatio) {
-      return json(503, { ok: false, error: 'E_BUSY 内存水位过高，合成暂不可用（稍后重试）' });
+    // 内存水位保护：只拦「冷启动拉起 SoVITS」——已存活时豁免（进程已在内存，
+    // 拒绝合成回收不了任何内存，只会误伤；空闲自动退出后守卫恢复把关）。
+    if (!sovitsUp) {
+      const freeRatio = os.freemem() / os.totalmem();
+      if (freeRatio < ttsCfg.memFreeRatio) {
+        return json(503, { ok: false, error: 'E_BUSY 内存水位过高，合成暂不可用（稍后重试）' });
+      }
     }
     try {
       const body = JSON.parse((await readBody(req)).toString('utf8'));

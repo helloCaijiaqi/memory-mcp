@@ -162,9 +162,11 @@ export function createRawCollection({ db, usable, writable, prepare }) {
       let next = row.text;
       for (const [ph, replacement] of clean) {
         if (/^ma_[0-9a-f]{12}$/.test(ph)) {
-          // id 已过 MEDIA_ID_RE 校验（ma_+纯 hex）——拼进正则无注入面
+          // id 已过 MEDIA_ID_RE 校验（ma_+纯 hex）——拼进正则无注入面。
+          // 函数式替换（2026-11-26）：清退替换文本现含描述封存，desc 可能带
+          // $&/$' 等——字符串替换会被当特殊模式解析。
           const phRe = new RegExp(`\\[(?:图片|语音|视频|文件|表情|媒体)\\|${ph}(?:\\|[^\\]]*)?\\]`, 'g');
-          next = next.replace(phRe, replacement);
+          next = next.replace(phRe, () => replacement);
         } else if (next.includes(ph)) {
           next = next.split(ph).join(replacement);
         }

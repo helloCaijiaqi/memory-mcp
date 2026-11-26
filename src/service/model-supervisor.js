@@ -14,9 +14,12 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '../..');
 
-function httpGetJson(url, timeoutMs = 3000) {
+function httpGetJson(url, timeoutMs = 3000, token = '') {
   return new Promise((resolve) => {
-    const req = http.get(url, { timeout: timeoutMs }, (res) => {
+    const req = http.get(url, {
+      timeout: timeoutMs,
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+    }, (res) => {
       let data = '';
       res.on('data', (c) => { data += c; });
       res.on('end', () => {
@@ -185,14 +188,21 @@ export function createModelSupervisor({ config = {}, logger = () => {} } = {}) {
         { text, refPath, promptText, promptLang }, 240000, cfg.token);
       return out ?? { ok: false, error: 'tts-svc 无响应' };
     },
-    /** 外部识图聚合（imageBase64 → {ok,desc,tags,source,cached}|{ok:false,reason}），未命中/失败返回 ok:false 由 adapter 落回 LLM 兜底 */
-    async recognize({ imageBase64, mime = 'image/png' } = {}) {
+    /** 外部识图聚合（imageBase64 → {ok,desc,tags,source,cached}|{ok:false,reason}），未命中/失败返回 ok:false 由 adapter 落回 LLM 兜底；
+     *  opts.source 强制仅用该源（失败不降级）、opts.refresh 跳过缓存读（换源重识语义，2026-11-26） */
+    async recognize({ imageBase64, mime = 'image/png', source, refresh } = {}) {
       if (!visionReady() || !imageBase64) return { ok: false, reason: 'vision-svc-not-ready' };
       const out = await httpPostJson(`http://127.0.0.1:${cfg.vision.port}/recognize`,
-        { imageBase64, mime }, 60000, cfg.token);
+        { imageBase64, mime, ...(source ? { source: String(source) } : {}), ...(refresh ? { refresh: true } : {}) }, 60000, cfg.token);
       if (out?.ok) return out;
       logger(`[model-hub] recognize 失败：${out === null ? 'vision-svc 无响应/超时' : `ok=${out?.ok} reason=${out?.reason ?? out?.error ?? ''}`}`);
       return out ?? { ok: false, reason: 'vision-svc-unavailable' };
+    },
+    /** 可用识图源清单（name/ready/quotaRemaining），vision-svc 未就绪返回 null */
+    async visionSources() {
+      if (!visionReady()) return null;
+      const out = await httpGetJson(`http://127.0.0.1:${cfg.vision.port}/sources`, cfg.token);
+      return out?.ok ? (out.sources ?? null) : null;
     },
     status() {
       return {
@@ -210,7 +220,7 @@ export function createModelSupervisor({ config = {}, logger = () => {} } = {}) {
  * - image：visionMode='vision-svc' 时转发 vision-svc 外部聚合，未命中/不可用落回 LLM vision 兜底
  * - video：退役（videoEnabled=false，资产保持 pending）
  */
-const VISION_SOURCE_ALIASES = { traceMoe: 'trace-moe', huggingFace: 'huggingface' };
+const VISION_SOURCE_ALIASES = { huggingFace: 'huggingface' }; // traceMoe 已退役（2026-11-26）
 export function createMediaModelAdapter({ llm, hub } = {}) {
   return {
     get enabled() { return Boolean(llm?.enabled); },
@@ -227,8 +237,21 @@ export function createMediaModelAdapter({ llm, hub } = {}) {
     /**
      * 图片识别：vision-svc 就绪优先转发（返回 {text, source}，source=实际命中源）；
      * 未命中/不可用/未配置时落回 llm.vision（source='llm-fallback'）。返回 {text, source}|null。
+     * args.source 指定时强制仅用该源（refresh 跳缓存）：失败**不落回** LLM 兜底，
+     * 返回 null 由上层报错——换源重试由调用方语义决定（2026-11-26）。
      */
     async vision(args = {}) {
+      if (args?.source && hub?.visionReady && args?.imageBase64) {
+        const out = await hub.recognize({
+          imageBase64: args.imageBase64,
+          mime: args.mime,
+          source: String(args.source),
+          refresh: args.refresh === true,
+        });
+        if (!out?.ok) return null;
+        const source = VISION_SOURCE_ALIASES[out.source] ?? String(out.source || args.source);
+        return { text: JSON.stringify({ desc: out.desc, tags: out.tags }), source };
+      }
       if (hub?.visionReady && args?.imageBase64) {
         const out = await hub.recognize({ imageBase64: args.imageBase64, mime: args.mime });
         if (out?.ok) {

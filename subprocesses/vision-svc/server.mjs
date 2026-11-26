@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 // vision-svc：外部识图聚合子服务（端口 18104）。
-// 聚合链：24h SHA-256 磁盘缓存 → SauceNAO/trace.moe 动漫双轨并行（相似度 >=80% 判命中）
+// 聚合链：24h SHA-256 磁盘缓存 → SauceNAO 动漫匹配（相似度 >=80% 判命中）
 //        → Cloudflare Workers AI 照片描述 → HuggingFace Inference → ok:false（由调用方落回 LLM 兜底）。
+// 换源重识（2026-11-26）：/recognize 支持 source（强制仅用该源，失败不降级，命中覆盖缓存）
+// 与 refresh（跳过缓存读全链重跑）；GET /sources 返回各源就绪/配额状态。
+// trace.moe 已剔除（2026-11-26 用户裁定：日语作品数据库，不符中文识图场景）。
 // 鉴权/健康/退避重启契约与 asr-svc、tts-svc 完全同构（/health 带 pid 供 supervisor 探活）。
 // 可测试性：createVisionServer 工厂（cacheDir/configPath/端点均可注入），顶层 main 守卫直跑。
 import { createServer } from 'node:http';
@@ -17,8 +20,9 @@ const DEFAULT_CACHE_DIR = path.join(REPO_ROOT, 'state', 'data', 'vision-cache');
 const DEFAULT_CONFIG_PATH = path.join(REPO_ROOT, 'vision.config.json');
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const ANIME_SIM_THRESHOLD = 80; // 双轨 >=80% 判命中
-const PROVIDERS = ['saucenao', 'traceMoe', 'cloudflare', 'huggingFace'];
+const ANIME_SIM_THRESHOLD = 80; // >=80% 判命中
+// trace.moe 已退役（2026-11-26 用户裁定：日语作品数据库，不符中文识图场景）
+const PROVIDERS = ['saucenao', 'cloudflare', 'huggingFace'];
 
 export function createVisionServer({
   port = DEFAULT_PORT,
@@ -54,14 +58,13 @@ export function createVisionServer({
     const c = providerConf(name);
     if (!c) return false;
     if (name === 'saucenao') return Boolean(c.apiKey);
-    if (name === 'traceMoe') return true; // 无 key 也可用（限流更严），有 key 提升额度
     if (name === 'cloudflare') return Boolean(c.accountId && c.apiToken);
     if (name === 'huggingFace') return Boolean(c.token);
     return false;
   }
   function providerQuota(name) {
     const c = providerConf(name);
-    return Number(c?.dailyQuota || (name === 'traceMoe' ? 120 : name === 'saucenao' ? 100 : name === 'cloudflare' ? 2000 : 50));
+    return Number(c?.dailyQuota || (name === 'saucenao' ? 100 : name === 'cloudflare' ? 2000 : 50));
   }
 
   // ---------- 配额计数（<cacheDir>/usage-YYYYMMDD.json，跨日自动重置） ----------
@@ -173,32 +176,7 @@ export function createVisionServer({
     return { sim: best.sim, desc, tags: chars.slice(0, 3) };
   }
 
-  async function traceMoeSearch(buf, mime) {
-    const conf = providerConf('traceMoe');
-    const mp = multipartBody('image', 'image.png', mime, buf);
-    const base = conf?.searchUrl || 'https://api.trace.moe/search';
-    const headers = { 'content-type': mp.contentType };
-    if (conf?.apiKey) headers['x-trace-key'] = conf.apiKey;
-    const { status, json } = await httpJson(`${base}?anilistInfo=1`, { method: 'POST', headers, body: mp.body, timeoutMs: 10000 });
-    if (status !== 200) throw new Error(`trace.moe http ${status}`);
-    const results = Array.isArray(json?.result) ? json.result : [];
-    let best = null;
-    for (const r of results) {
-      const sim = Number(r?.similarity || 0) * 100;
-      if (!best || sim > best.sim) best = { sim, a: r?.anilist || {}, episode: r?.episode };
-    }
-    if (!best) throw new Error('trace.moe empty results');
-    const t = best.a.title || {};
-    const title = t.native || t.romaji || t.english || '';
-    const chars = (Array.isArray(best.a.characters) ? best.a.characters : [])
-      .map((c) => c?.name?.full)
-      .filter(Boolean)
-      .slice(0, 3);
-    const charPart = chars.length ? `角色 ${chars.join('、')}` : '';
-    const epPart = best.episode ? `第 ${best.episode} 话` : '';
-    const desc = `动漫画面：${[charPart, title ? `出自《${title}》` : '', epPart].filter(Boolean).join('')}（trace.moe 相似度 ${best.sim.toFixed(1)}%）`.trim();
-    return { sim: best.sim, desc, tags: chars };
-  }
+  // traceMoeSearch 已剔除（2026-11-26 用户裁定：日语作品数据库，不符中文识图场景）
 
   async function cloudflareDescribe(buf, mime) {
     const conf = providerConf('cloudflare');
@@ -244,40 +222,58 @@ export function createVisionServer({
   }
 
   // ---------- 聚合链 ----------
-  async function recognize(imageBase64, mime = 'image/png') {
+  /**
+   * recognize(imageBase64, mime, opts)
+   *  - 无 opts：缓存命中即返回（cached:true）→ saucenao 动漫匹配（>=80% 判命中）
+   *    → 照片域 cloudflare → huggingFace 逐级降级 → ok:false（调用方落回 LLM 兜底）。
+   *  - opts.source ∈ PROVIDERS：**强制仅用该源**——跳过缓存读、不跑其它源、失败返回
+   *    ok:false 不降级；成功后 writeCache 覆盖同 hash 缓存（换源重识的「更新」语义）。
+   *  - opts.refresh：跳过缓存读全链重跑（命中仍覆盖写缓存）。
+   */
+  async function recognize(imageBase64, mime = 'image/png', { source, refresh } = {}) {
     const buf = Buffer.from(String(imageBase64 || ''), 'base64');
     if (!buf.length) return { ok: false, reason: 'empty-image' };
+    if (source && !PROVIDERS.includes(source)) return { ok: false, reason: `unknown-source:${source}` };
     const hash = createHash('sha256').update(buf).digest('hex');
 
-    const cached = readCache(hash);
-    if (cached) {
-      return { ok: true, desc: cached.desc, tags: cached.tags || [], source: cached.source, cached: true, hash };
-    }
-
-    // 动漫双轨并行（配额可用才烧请求）
-    const tasks = [];
-    for (const [name, fn] of [['saucenao', sauceNaoSearch], ['traceMoe', traceMoeSearch]]) {
-      if (providerReady(name) && quotaAvailable(name)) {
-        tasks.push(
-          fn(buf, mime)
-            .then((r) => ({ name, ...r }))
-            .catch((err) => {
-              console.error(`[vision-svc] ${name} failed:`, err.message);
-              return null;
-            })
-        );
-      } else {
-        tasks.push(Promise.resolve(null));
+    if (!refresh && !source) {
+      const cached = readCache(hash);
+      if (cached) {
+        return { ok: true, desc: cached.desc, tags: cached.tags || [], source: cached.source, cached: true, hash };
       }
     }
-    const [sauceRes, traceRes] = await Promise.all(tasks);
-    for (const r of [sauceRes, traceRes]) if (r) bumpQuota(r.name);
 
-    const hits = [sauceRes, traceRes].filter((r) => r && r.sim >= ANIME_SIM_THRESHOLD).sort((a, b) => b.sim - a.sim);
-    if (hits.length) {
-      const hit = hits[0];
-      writeCache(hash, hit.desc, hit.tags, hit.name);
-      return { ok: true, desc: hit.desc, tags: hit.tags, source: hit.name, cached: false, hash };
+    // 强制单一源：只跑指定源，成功覆盖缓存，失败不降级（换源重试由调用方决定）
+    if (source) {
+      if (!providerReady(source)) return { ok: false, reason: 'source-not-ready', source, hash };
+      if (!quotaAvailable(source)) return { ok: false, reason: 'source-quota-exhausted', source, hash };
+      const runners = { saucenao: sauceNaoSearch, cloudflare: cloudflareDescribe, huggingFace: huggingFaceDescribe };
+      try {
+        const r = await runners[source](buf, mime);
+        bumpQuota(source);
+        const desc = r.desc, tags = r.tags ?? [];
+        writeCache(hash, desc, tags, source);
+        return { ok: true, desc, tags, source, cached: false, hash };
+      } catch (err) {
+        console.error(`[vision-svc] ${source} failed (forced):`, err.message);
+        return { ok: false, reason: 'source-failed', source, hash };
+      }
+    }
+
+    // 动漫匹配（配额可用才烧请求）
+    let animeRes = null;
+    if (providerReady('saucenao') && quotaAvailable('saucenao')) {
+      animeRes = await sauceNaoSearch(buf, mime)
+        .then((r) => ({ name: 'saucenao', ...r }))
+        .catch((err) => {
+          console.error('[vision-svc] saucenao failed:', err.message);
+          return null;
+        });
+    }
+    if (animeRes) bumpQuota(animeRes.name);
+    if (animeRes && animeRes.sim >= ANIME_SIM_THRESHOLD) {
+      writeCache(hash, animeRes.desc, animeRes.tags, animeRes.name);
+      return { ok: true, desc: animeRes.desc, tags: animeRes.tags, source: animeRes.name, cached: false, hash };
     }
 
     // 照片域：Cloudflare → HF，逐级降级
@@ -331,12 +327,27 @@ export function createVisionServer({
         keys: Object.fromEntries(PROVIDERS.map((p) => [p, providerReady(p)])),
       });
     }
+    if (url.pathname === '/sources' && req.method === 'GET') {
+      if (!authorized(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
+      const used = readUsage();
+      return json(res, 200, {
+        ok: true,
+        sources: PROVIDERS.map((p) => ({
+          name: p,
+          ready: providerReady(p),
+          quotaRemaining: Math.max(0, providerQuota(p) - (used[p] || 0)),
+        })),
+      });
+    }
     if (url.pathname === '/recognize' && req.method === 'POST') {
       if (!authorized(req)) return json(res, 401, { ok: false, error: 'unauthorized' });
       try {
         const body = JSON.parse((await readBody(req)).toString('utf8'));
         if (!body?.imageBase64) return json(res, 400, { ok: false, error: 'imageBase64 required' });
-        const out = await recognize(body.imageBase64, String(body.mime || 'image/png'));
+        const out = await recognize(body.imageBase64, String(body.mime || 'image/png'), {
+          source: body.source ? String(body.source) : undefined,
+          refresh: body.refresh === true,
+        });
         return json(res, 200, out);
       } catch (err) {
         console.error('[vision-svc] recognize error:', err.message);
@@ -351,6 +362,7 @@ export function createVisionServer({
     port,
     recognize,
     keys: () => Object.fromEntries(PROVIDERS.map((p) => [p, providerReady(p)])),
+    sources: () => PROVIDERS.map((p) => ({ name: p, ready: providerReady(p), quotaRemaining: Math.max(0, providerQuota(p) - (readUsage()[p] || 0)) })),
     usage: () => readUsage(),
     listen: () =>
       new Promise((resolve, reject) => {

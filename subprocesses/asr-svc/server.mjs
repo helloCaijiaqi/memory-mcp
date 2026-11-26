@@ -14,6 +14,7 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const sherpaOnnx = require('sherpa-onnx-node');
+const { isSilk, decode: silkDecode } = require('silk-wasm');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.ASR_PORT || 18102);
@@ -73,9 +74,28 @@ function findFfmpeg() {
 let ffmpegBin = null;
 try { ffmpegBin = findFfmpeg(); } catch { ffmpegBin = null; }
 
-function transcodeToWav(srcPath, mime) {
+async function transcodeToWav(srcPath, mime) {
   const isWav = /\.wav$/i.test(srcPath) || String(mime || '').includes('wav');
   if (isWav) return srcPath;
+  // QQ 语音实为 SILK V3（文件常带 .amr 后缀的假名），ffmpeg 不支持 → silk-wasm 解码
+  // 成 PCM（24kHz mono s16）后补 WAV 头（sherpa readWave 带重采样，22050→16k 已验证）。
+  const head = Buffer.alloc(8);
+  const fd = fs.openSync(srcPath, 'r');
+  try { fs.readSync(fd, head, 0, 8, 0); } finally { fs.closeSync(fd); }
+  if (head.subarray(1, 9).toString('ascii').includes('#!SILK') || isSilk(head)) {
+    const silk = fs.readFileSync(srcPath);
+    const { data } = await silkDecode(silk, 24000);   // Uint8Array PCM s16le mono 24kHz
+    const out = `${srcPath}.24k.wav`;
+    const pcm = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    const header = Buffer.alloc(44);
+    header.write('RIFF', 0); header.writeUInt32LE(36 + pcm.length, 4); header.write('WAVE', 8);
+    header.write('fmt ', 12); header.writeUInt32LE(16, 16); header.writeUInt16LE(1, 20);
+    header.writeUInt16LE(1, 22); header.writeUInt32LE(24000, 24); header.writeUInt32LE(48000, 28);
+    header.writeUInt16LE(2, 32); header.writeUInt16LE(16, 34);
+    header.write('data', 36); header.writeUInt32LE(pcm.length, 40);
+    fs.writeFileSync(out, Buffer.concat([header, pcm]));
+    return out;
+  }
   const out = `${srcPath}.16k.wav`;
   const { execFileSync } = require('node:child_process');
   execFileSync(ffmpegBin, [
@@ -86,12 +106,12 @@ function transcodeToWav(srcPath, mime) {
   return out;
 }
 
-function transcribeWav(base64, mime) {
+async function transcribeWav(base64, mime) {
   const tmp = path.join(os.tmpdir(), `memhub-asr-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   fs.writeFileSync(tmp, Buffer.from(base64, 'base64'));
   let wavPath = tmp;
   try {
-    wavPath = transcodeToWav(tmp, mime);
+    wavPath = await transcodeToWav(tmp, mime);
     const { samples, sampleRate } = sherpaOnnx.readWave(wavPath);
     if (!samples || samples.length === 0) throw new Error('empty audio samples');
     const t0 = Date.now();

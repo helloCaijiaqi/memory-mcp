@@ -19,6 +19,7 @@ import { createRelationPendingCollection } from './sqlite-relation-pending.js';
 import { createSubjectAliasCollection } from './sqlite-subject-alias.js';
 
 const ALTER_ADD_COLUMN_RE = /^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+([A-Za-z_][A-Za-z0-9_]*)/i;
+const ALTER_DROP_COLUMN_RE = /^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+DROP\s+COLUMN\s+([A-Za-z_][A-Za-z0-9_]*)/i;
 
 function readUserVersion(db) {
   try {
@@ -43,9 +44,19 @@ function tableColumns(db, table) {
 
 function runMigrationStatements(db, statements) {
   for (const statement of statements) {
-    const alter = ALTER_ADD_COLUMN_RE.exec(statement);
-    // 手工加过列的库（DB Browser、临时脚本）不该在这里炸：列已存在就跳过。
-    if (alter && tableColumns(db, alter[1]).has(alter[2])) continue;
+    // 函数形式迁移步：自己负责幂等（用于依赖列存在性的数据回填——纯 SQL 无法
+    // 表达「列存在才执行」，如 v8 的 ref→source_path 回填）。
+    if (typeof statement === 'function') {
+      statement(db);
+      continue;
+    }
+    // ADD/DROP COLUMN 双向幂等守卫：ADD 已存在就跳过；DROP 列不存在就跳过
+    // （新库从 baseline 直接建表、user_version 从 0 逐版本重放全部迁移，
+    // baseline 已不含被退役的列，没有守卫会在 DROP 上炸）。
+    const add = ALTER_ADD_COLUMN_RE.exec(statement);
+    if (add && tableColumns(db, add[1]).has(add[2])) continue;
+    const drop = ALTER_DROP_COLUMN_RE.exec(statement);
+    if (drop && !tableColumns(db, drop[1]).has(drop[2])) continue;
     db.exec(statement);
   }
 }

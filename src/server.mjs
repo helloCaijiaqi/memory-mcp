@@ -25,7 +25,7 @@ import { createLlmProvider } from './llm-provider.js';
 import { loadEnvFile } from './load-env.js';
 import { createModelSupervisor, createMediaModelAdapter } from './service/model-supervisor.js';
 import { createVoiceSynthWorker } from './service/voice-synth.js';
-import { createVoiceBank } from './service/voice-bank.js';
+import { createRoleVoiceScanner } from './service/role-voice-scanner.js';
 import { createHttpApi } from './http-api.js';
 import { serveStdio } from './mcp-memory.js';
 
@@ -288,29 +288,50 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
     repairPlaceholder: (id, retiredText) =>
       mediaRetention.repairPlaceholderBatch(store, [id], retiredText ?? undefined, log),
   });
-  const mediaAnalyzer = createMediaAnalyzer({ store, service: media, llm: mediaLlm, logger: log });
+  const mediaAnalyzer = createMediaAnalyzer({
+    store,
+    service: media,
+    llm: mediaLlm,
+    config: { voiceInboxDir: process.env.MEMORY_MCP_VOICE_RUNTIME_DIR || path.join(cfg.stateDir, 'media', 'qq', 'audio') },
+    logger: log,
+  });
   mediaAnalyzer.start();
-  // voice-bank 角色音色库（voice_bank.json）：角色→关键词→情绪→参考音频；
-  // inbox 暂存超龄清理随进程周期运行。
-  const voiceBank = createVoiceBank({
-    bankPath: path.join(cfg.stateDir, 'voice_bank.json'), // 严格布局：运行时可变数据归 state/data（随 npm run backup 备份）
-    defaultLibDir: llm?.config?.audio?.libDir ?? '',
+  // 媒体缺省清退（媒体管道 v2）：未收藏且超龄（缺省 30 天）的资产删源文件+删记录，
+  // 删行时批量修复摘要/raw 占位符；收藏豁免。配置 config.json mediaRetention 块。
+  // 装配先于 voiceBank（2026-11-26）：scanner prune 的 retireAsset 清退管道接线
+  // 依赖它（启动即跑一轮 prune，不能 late-binding 空引用）；无循环依赖。
+  const mediaRetention = createMediaRetention({ store, media, config: cfg.mediaRetention ?? {}, logger: log });
+  mediaRetention.start();
+  // 角色音色库（目录即数据库）：audios/[角色]/config.json + 情绪音频，扫描器带
+  // mtime 指纹缓存热加载。配置/运行时分离：配置区 audios/ 只放角色夹（固定资产）。
+  // 运行时区三区合一（2026-11-26）：inbox（收到暂存）与 out（合成产物）并入
+  // media/qq/audio 与 bridge 收媒体同目录共用，文件名分段 ma_<id>.<段>.<ext> 区分
+  // 生命周期：.in 3 天归档窗口 / .out 7 天 / 无段名 30 天兜底；带段删除一律走
+  // retireAsset 清退管道（删源文件+删详情行+raw 占位符固化），绝不裸删。
+  const voiceRuntimeDir = process.env.MEMORY_MCP_VOICE_RUNTIME_DIR
+    || path.join(cfg.stateDir, 'media', 'qq', 'audio');
+  const voiceBank = createRoleVoiceScanner({
+    voiceDir: path.resolve(PKG_ROOT, 'audios'),
+    inboxDir: voiceRuntimeDir,
+    outDir: voiceRuntimeDir,
+    config: {
+      pruneDays: Number(process.env.MEMORY_MCP_VOICE_PRUNE_DAYS || 3) || 3,
+      outPruneDays: Number(process.env.MEMORY_MCP_VOICE_OUT_PRUNE_DAYS || 7) || 7,
+      unsegmentedPruneDays: Number(process.env.MEMORY_MCP_VOICE_UNSEGMENTED_PRUNE_DAYS || 30) || 30,
+    },
+    retireAsset: (row) => mediaRetention.retireOne(row),
     logger: log,
   });
   voiceBank.start();
   // voice-synth 异步合成 worker（chat_voice_synthesize 工具链）：文本 → 克隆音色
-  // 语音落 voice_lib（qq-bridge audio/）。TTS 子服务随 GPT-SoVITS 集成包启用。
+  // 语音落 voiceRuntimeDir（ma_<id>.out.wav 分段命名）。TTS 子服务随 GPT-SoVITS 集成包启用。
   const voiceSynth = createVoiceSynthWorker({
     media,
     hub: modelHub,
     bank: voiceBank,
-    config: { voiceLibDir: llm?.config?.audio?.libDir ?? '' },
+    config: { outDir: voiceRuntimeDir },
     logger: log,
   });
-  // 媒体缺省清退（媒体管道 v2）：未收藏且超龄（缺省 30 天）的资产删源文件+删记录，
-  // 删行时批量修复摘要/raw 占位符；收藏豁免。配置 config.json mediaRetention 块。
-  const mediaRetention = createMediaRetention({ store, media, config: cfg.mediaRetention ?? {}, logger: log });
-  mediaRetention.start();
   // subject 身份层 + session-save 编排（tool.call 统一改造）：网关经 tool.call
   // chat_memory_save 投递整段缓冲，单事务落地 raw/别名/摘要/画像/关系并推进纪元；
   // 内部空闲摘要调度器已删除，落地时机完全由网关裁决。
@@ -370,12 +391,14 @@ export async function start({ env = process.env, stdio = true, http: withHttp = 
         subject,
         sessionSave,
         media,
-        // chat_media_describe 主动解析需要 analyzer 的 analyzeOne（媒体管道 v3）
+        // chat_image_describe 主动解析需要 analyzer 的 analyzeOne（媒体管道 v3）
         mediaAnalyzer,
         // chat_voice_synthesize 主动开口说话（voice-synth 异步 worker）
         voiceSynth,
         // chat_voice_bank_list / chat_voice_bank_add（角色音色库）
         voiceBank,
+        // chat_vision_sources 识图源清单（model-hub supervisor，2026-11-26 换源重识）
+        modelHub,
         logger: log,
       });
     } else {

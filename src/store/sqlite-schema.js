@@ -8,7 +8,7 @@
 // 为什么不用 SCHEMA 改表：SCHEMA 靠 IF NOT EXISTS 执行，对「表已存在但缺列」完全无效，
 // 老库会静默缺列（写入报错或字段丢失），这类问题在生产上极难定位。
 
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 8;
 
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS memory (
@@ -133,8 +133,8 @@ CREATE INDEX IF NOT EXISTS idx_subject_alias_lookup
 -- 消息文本；session-save 落 raw 时检测占位符 + 随行 media 元数据 → 按 id 在此
 -- 自动新建详情记录（status=pending）；LLM 解析（网关/DSH 回写或 media-analyzer
 -- 兜底队列）完成后回写 desc/tags 并置 ready。kind 统一大范围概念（image 涵盖
--- 表情包，无独立 sticker），ref 存平台发送凭据（QQ 收藏 resId / 语音库相对路径 /
--- 源 URL），send_hints 存各平台发送方式提示（跨平台发送适配层读取）。
+-- 表情包，无独立 sticker），source_path 是唯一「源定位符」（本地绝对路径或源
+-- URL，v8 起 ref 列退役并入此列），send_hints 存各平台发送方式提示。
 CREATE TABLE IF NOT EXISTS media_asset (
   id           TEXT PRIMARY KEY,
   session_id   TEXT NOT NULL,
@@ -143,7 +143,6 @@ CREATE TABLE IF NOT EXISTS media_asset (
   source_path  TEXT NOT NULL DEFAULT '',
   hash         TEXT NOT NULL DEFAULT '',
   origin       TEXT NOT NULL DEFAULT 'inbound',
-  ref          TEXT NOT NULL DEFAULT '',
   send_hints   TEXT NOT NULL DEFAULT '{}',
   desc         TEXT NOT NULL DEFAULT '',
   tags         TEXT NOT NULL DEFAULT '[]',
@@ -155,6 +154,7 @@ CREATE TABLE IF NOT EXISTS media_asset (
   phash        TEXT NOT NULL DEFAULT '',
   merged_into  TEXT NOT NULL DEFAULT '',
   is_sticker   INTEGER NOT NULL DEFAULT 0,
+  favorited    INTEGER NOT NULL DEFAULT 0,
   created_at   INTEGER NOT NULL,
   updated_at   INTEGER NOT NULL
 );
@@ -397,6 +397,39 @@ export const MIGRATIONS = [
       `ALTER TABLE media_asset DROP COLUMN favorited`,
     ],
   },
+  {
+    version: 7,
+    statements: [
+      // --- 收藏标识回归（2026-11-26 清退语义重设计）：
+      //     favorited 作为清退豁免的唯一依据（替代 status='ready' 隐式豁免）——收藏资产
+      //     豁免「主动删文件」路径（retention 定时清退 / inbox+out prune 清扫）；懒清退
+      //     （渲染时源文件真缺失）不受收藏豁免。收藏动作：chat_media_favorite 工具 /
+      //     热门图片 use_count 超阈值自动收藏。
+      `ALTER TABLE media_asset ADD COLUMN favorited INTEGER NOT NULL DEFAULT 0`,
+      `CREATE INDEX IF NOT EXISTS idx_media_fav ON media_asset(favorited) WHERE favorited = 1`,
+    ],
+  },
+  {
+    version: 8,
+    statements: [
+      // --- ref 列退役（2026-11-26）：路径唯一真值收敛到 source_path。
+      //     先回填（source_path 为空且 ref 是绝对路径/URL——含冒号即视作源定位符；
+      //     纯占位文件名如 ma_xxx.wav 无冒号，是死任务残留，随列一起废弃），
+      //     再整列删除。回填用函数形式自守幂等（新库 baseline 已无 ref 列，
+      //     纯 SQL 无法表达「列存在才执行」）；DROP 的幂等守卫在 sqlite-store。
+      (db) => {
+        const cols = new Set(
+          db.prepare('PRAGMA table_info(media_asset)').all().map((r) => String(r.name)),
+        );
+        if (cols.has('ref')) {
+          db.exec(`UPDATE media_asset SET source_path = ref
+                     WHERE (source_path IS NULL OR source_path = '')
+                       AND ref LIKE '%:%'`);
+        }
+      },
+      `ALTER TABLE media_asset DROP COLUMN ref`,
+    ],
+  },
 ];
 
 function parseIdList(value) {
@@ -617,7 +650,6 @@ export function mediaFromRow(row) {
     sourcePath: row.source_path ?? '',
     hash: row.hash ?? '',
     origin: row.origin,
-    ref: row.ref ?? '',
     sendHints,
     desc: row.desc ?? '',
     tags: parseTags(row.tags),
@@ -629,6 +661,7 @@ export function mediaFromRow(row) {
     phash: row.phash ?? '',
     mergedInto: row.merged_into ?? '',
     isSticker: row.is_sticker === 1,
+    favorited: row.favorited === 1,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

@@ -22,6 +22,9 @@ scripts/_probe-*.mjs
 # dedicated model weights (large binaries)
 models/
 
+# 角色音色库配置区（目录即数据库，wav 大二进制不入库）
+audios/
+
 # external vision API keys
 vision.config.json
 

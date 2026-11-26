@@ -25,7 +25,9 @@ export const QUERY_STRATEGIES = ['fts5', 'like', 'scan'];
 
 // 多媒体记忆层（media memory tier）：统一大范围 kind（image 涵盖表情包，无独立 sticker）。
 export const MEDIA_KINDS = ['image', 'voice', 'video', 'file'];
-export const MEDIA_STATUS = ['pending', 'ready', 'failed'];
+// synthesizing（2026-11-26）：voice-synth 合成占位态——合成 25-90s > analyzer 60s
+// 兜底轮，不进枚举会被归一化回 pending 被 no-audio-data 误杀（实测）。
+export const MEDIA_STATUS = ['pending', 'synthesizing', 'ready', 'failed'];
 export const MEDIA_ORIGINS = ['inbound', 'collect', 'voice_lib', 'manual'];
 // 占位符格式与 id 校验（媒体管道 v3）：bridge 生成 `ma_<sha1 前 12 位>`，
 // 消息文本内嵌唯一格式 `[图片|<id>]`（可选第三段容忍描述形态，提取只取 id）；
@@ -202,10 +204,11 @@ export function normalizeMediaRow(row, { now = nowMs() } = {}) {
     sessionId,
     platform: parseSessionId(sessionId).platform,
     kind,
-    sourcePath: String(row.sourcePath ?? '').trim(),
+    // ref 列已退役（v8）：source_path 是唯一源定位符（本地路径或 URL）。
+    // 兼容期接受入参 row.ref 作为 sourcePath 的回退源（调用方尚未全部改造）。
+    sourcePath: String(row.sourcePath ?? row.ref ?? '').trim(),
     hash: String(row.hash ?? '').trim(),
     origin,
-    ref: String(row.ref ?? '').trim(),
     sendHints,
     desc: String(row.desc ?? '').trim(),
     tags,
@@ -219,6 +222,9 @@ export function normalizeMediaRow(row, { now = nowMs() } = {}) {
     phash: String(row.phash ?? '').trim(),
     mergedInto: String(row.mergedInto ?? '').trim(),
     isSticker: row.isSticker === true || row.isSticker === 1,
+    // 收藏标识（v7 迁移回归，2026-11-26）：清退豁免唯一依据——豁免 retention 定时清退
+    // 与 inbox/out prune 清扫；懒清退（源文件真缺失）不受豁免。
+    favorited: row.favorited === true || row.favorited === 1,
     createdAt: clampInt(row.createdAt, 0, Number.MAX_SAFE_INTEGER, now),
     // updatedAt 可覆盖（媒体管道 v2）：清退/修复场景按内容回写时间戳；常规登记不传即 now。
     updatedAt: row.updatedAt != null ? clampInt(row.updatedAt, 0, Number.MAX_SAFE_INTEGER, now) : now,
